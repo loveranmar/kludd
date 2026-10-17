@@ -182,6 +182,7 @@ impl Kludd {
         });
         kludd.connect(app);
         kludd.watch_dir();
+        hypr::focus_when_shown();
         kludd.rescan();
         kludd.start_clock();
         kludd.update_status();
@@ -588,21 +589,26 @@ fn clock() -> String {
 
 /// Hyprland IPC over its request socket; no `hyprctl` process needed.
 mod hypr {
-    use std::io::{Read, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
 
     const WORKSPACE: &str = "kludd";
+    const CLASS: &str = r"^(io\.github\.loveranmar\.Kludd)$";
 
-    fn socket() -> Option<PathBuf> {
+    fn socket_path(name: &str) -> Option<PathBuf> {
         let signature = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
         Some(
             PathBuf::from(runtime)
                 .join("hypr")
                 .join(signature)
-                .join(".socket.sock"),
+                .join(name),
         )
+    }
+
+    fn socket() -> Option<PathBuf> {
+        socket_path(".socket.sock")
     }
 
     pub fn available() -> bool {
@@ -624,5 +630,26 @@ mod hypr {
 
     pub fn toggle() {
         request(&format!("dispatch togglespecialworkspace {WORKSPACE}"));
+    }
+
+    /// Hyprland only refocuses the window it last focused in a special
+    /// workspace, and a window started `silent` was never focused. So when
+    /// `special:kludd` opens (the Home bind), focus Kludd ourselves, from a
+    /// thread that follows Hyprland's event socket.
+    pub fn focus_when_shown() {
+        let Some(path) = socket_path(".socket2.sock") else {
+            return;
+        };
+        let opened = format!("activespecial>>special:{WORKSPACE},");
+        std::thread::spawn(move || {
+            let Ok(stream) = UnixStream::connect(path) else {
+                return;
+            };
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                if line.starts_with(&opened) {
+                    request(&format!("dispatch focuswindow class:{CLASS}"));
+                }
+            }
+        });
     }
 }

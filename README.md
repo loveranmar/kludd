@@ -73,6 +73,8 @@ windowrule {
 }
 ```
 
+If you used `install.sh`, `~/.local/bin` may not be on Hyprland's `PATH`; write `~/.local/bin/kludd` as the full path (`/home/you/.local/bin/kludd`) in the `exec-once` line. When `special:kludd` opens, Kludd focuses itself through Hyprland's event socket, so you can start typing right away.
+
 To open `.md` files with Kludd by default, run `xdg-mime default kludd.desktop text/markdown`.
 
 ## Keyboard shortcuts

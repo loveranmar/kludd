@@ -29,7 +29,9 @@ cd "$(dirname "$0")"
 cargo build --release --locked
 
 install -Dm755 target/release/kludd "$BIN"
-install -Dm644 assets/kludd.desktop "$DESKTOP"
+# absolute Exec: ~/.local/bin is often not on the compositor's PATH
+mkdir -p "$(dirname "$DESKTOP")"
+sed "s|^Exec=kludd|Exec=$BIN|" assets/kludd.desktop > "$DESKTOP"
 install -Dm644 "assets/$APP_ID.svg" "$ICON"
 install -Dm644 "assets/fonts/Fredoka[wdth,wght].ttf" "$FONT_DIR/Fredoka[wdth,wght].ttf"
 install -Dm644 assets/fonts/OFL.txt "$FONT_DIR/OFL.txt"
@@ -46,5 +48,5 @@ case ":$PATH:" in
 esac
 if pgrep -x kludd >/dev/null 2>&1; then
     echo "Kludd is running the old version. Restart it with:"
-    echo "  kludd --quit; hyprctl dispatch exec '[workspace special:kludd silent] kludd --hidden'"
+    echo "  $BIN --quit; hyprctl dispatch exec '[workspace special:kludd silent] $BIN --hidden'"
 fi
