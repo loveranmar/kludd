@@ -303,8 +303,9 @@ impl Kludd {
         self.window.connect_is_active_notify(move |window| {
             let Some(k) = weak.upgrade() else { return };
             if window.is_active() {
-                if k.page.get() == Page::Home {
-                    k.home.refresh_dates();
+                match k.page.get() {
+                    Page::Home => k.home.refresh_dates(),
+                    Page::Editor => k.editor.refresh_toolbar(),
                 }
             } else {
                 k.editor.save_sync();
@@ -407,6 +408,7 @@ impl Kludd {
         self.editor.save_sync();
         self.editor.hide_toolbar();
         self.home.close_popovers();
+        self.clear_error();
         self.window.set_visible(false);
     }
 
@@ -465,12 +467,13 @@ impl Kludd {
 
     fn show_editor(&self) {
         self.home.close_popovers();
+        // the search was for finding this note; home starts fresh next time
+        self.home.clear_search();
         self.page.set(Page::Editor);
         self.stack.set_visible_child_name("editor");
         self.statusbar.add_css_class("tall");
         self.editor.focus();
-        self.error.replace(None);
-        self.update_status();
+        self.clear_error();
     }
 
     // -- settings --------------------------------------------------------------
@@ -530,9 +533,28 @@ impl Kludd {
         }
     }
 
-    fn show_error(&self, message: String) {
+    /// Shows an error in the status bar for a few seconds. The beginning
+    /// ("could not open …") is what matters, so the end gets cut if long.
+    fn show_error(self: &Rc<Self>, message: String) {
         eprintln!("kludd: {message}");
-        self.error.replace(Some(message));
+        self.error.replace(Some(message.clone()));
+        self.status_left
+            .set_ellipsize(gtk::pango::EllipsizeMode::End);
+        self.update_status();
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_seconds_local_once(6, move || {
+            if let Some(k) = weak.upgrade()
+                && k.error.borrow().as_deref() == Some(message.as_str())
+            {
+                k.clear_error();
+            }
+        });
+    }
+
+    fn clear_error(&self) {
+        self.error.replace(None);
+        self.status_left
+            .set_ellipsize(gtk::pango::EllipsizeMode::Start);
         self.update_status();
     }
 

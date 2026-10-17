@@ -202,11 +202,26 @@ impl View {
                 }
                 if x2 > x1 {
                     let glyphs = self.iter_location(&a);
-                    let (y, height) = if single {
+                    let (mut y, mut height) = if single {
                         self.glyph_box(&glyphs)
                     } else {
                         self.line_box(&glyphs)
                     };
+                    // inside a multi-line selection, also cover the spacing
+                    // between paragraphs (headings, list starts) so the
+                    // block has no stripes
+                    if !single {
+                        let (py, ph) = self.line_yrange(&line);
+                        let (py, pbottom) = (py as f32, (py + ph) as f32);
+                        if line.starts_line() && start < line && py < y {
+                            height += y - py;
+                            y = py;
+                        }
+                        let ends_paragraph = last_line || next.line() > line.line();
+                        if ends_paragraph && end > next && pbottom > y + height {
+                            height = pbottom - y;
+                        }
+                    }
                     let rect = graphene::Rect::new(x1 as f32, y, (x2 - x1) as f32, height);
                     snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(rect, radius));
                     snapshot.append_color(&color, &rect);
@@ -352,6 +367,9 @@ struct Step {
     cursor_after: i32,
     /// Typing a single character on one line: merges with the next one.
     typing: bool,
+    /// The character typed, if this step typed one: a space after a word
+    /// starts a new undo step, so undo goes back a word at a time.
+    typed: Option<char>,
     at: Instant,
 }
 
@@ -366,6 +384,8 @@ struct Doc {
     /// Created in this session; trashed again if left empty.
     created: bool,
     final_eol: Eol,
+    /// Line break this note uses (CRLF files stay CRLF when typing Enter).
+    newline: Eol,
     /// File contents as last read or written.
     saved: String,
     dirty: bool,
@@ -931,6 +951,7 @@ impl Editor {
             cursor_before,
             cursor_after: end.offset(),
             typing,
+            typed: if typing { text.chars().next() } else { None },
             at: Instant::now(),
         });
         self.changed();
@@ -1027,6 +1048,7 @@ impl Editor {
             cursor_before,
             cursor_after: at.offset(),
             typing,
+            typed: None,
             at: Instant::now(),
         });
         self.changed();
@@ -1143,6 +1165,7 @@ impl Editor {
                 cursor_before,
                 cursor_after: self.0.buffer.cursor_position(),
                 typing: false,
+                typed: None,
                 at: Instant::now(),
             });
             self.changed();
@@ -1158,9 +1181,7 @@ impl Editor {
         self.0
             .buffer
             .place_cursor(&self.0.buffer.iter_at_offset(cursor_after));
-        self.0
-            .view
-            .scroll_mark_onscreen(&self.0.buffer.get_insert());
+        self.scroll_to_cursor();
         self.push_step(Step {
             first,
             before,
@@ -1168,6 +1189,7 @@ impl Editor {
             cursor_before,
             cursor_after,
             typing: false,
+            typed: None,
             at: Instant::now(),
         });
         self.changed();
@@ -1185,9 +1207,13 @@ impl Editor {
             && step.before.len() == 1
             && last.cursor_after == step.cursor_before
             && step.at.duration_since(last.at) < Duration::from_secs(1)
+            // a space after a word starts the next undo step
+            && (!step.typed.is_some_and(char::is_whitespace)
+                || last.typed.is_some_and(char::is_whitespace))
         {
             last.after = step.after;
             last.cursor_after = step.cursor_after;
+            last.typed = step.typed;
             last.at = step.at;
             return;
         }
@@ -1219,10 +1245,26 @@ impl Editor {
         self.relayout();
     }
 
+    /// Brings the cursor into view once GTK has laid the text out (an
+    /// immediate scroll uses estimated line heights and lands anywhere).
+    fn scroll_to_cursor(&self) {
+        let mark = self.0.buffer.get_insert();
+        self.0.view.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
+    }
+
+    fn newline(&self) -> Eol {
+        self.0
+            .state
+            .borrow()
+            .doc
+            .as_ref()
+            .map_or(Eol::Lf, |d| d.newline)
+    }
+
     fn place_cursor(&self, offset: i32) {
         let buffer = &self.0.buffer;
         buffer.place_cursor(&buffer.iter_at_offset(offset));
-        self.0.view.scroll_mark_onscreen(&buffer.get_insert());
+        self.scroll_to_cursor();
     }
 
     /// Lines touched by the selection (or the cursor line).
@@ -1404,7 +1446,11 @@ impl Editor {
         }
         match key {
             gdk::Key::Tab if mods.is_empty() => self.indent_bullets(1),
-            gdk::Key::ISO_Left_Tab | gdk::Key::Tab => self.indent_bullets(-1),
+            gdk::Key::ISO_Left_Tab | gdk::Key::Tab => {
+                // outdents bullets; elsewhere it does nothing (no stray tab)
+                self.indent_bullets(-1);
+                true
+            }
             gdk::Key::space if mods.is_empty() => self.autoformat(),
             gdk::Key::Return | gdk::Key::KP_Enter => self.enter(),
             gdk::Key::BackSpace if mods.is_empty() => self.backspace(),
@@ -1437,26 +1483,34 @@ impl Editor {
             "##" => LineKind::H2,
             _ => return false,
         };
+        // the space is typed as usual first, so undoing the formatting
+        // leaves the literal "- " (and typing on keeps it literal)
+        self.0.buffer.insert_interactive_at_cursor(" ", true);
+        let prefix = typed.chars().count() as i32 + 1;
         self.change(line, line, || {
             let mut a = self.line_start(line);
-            let mut b = self
-                .0
-                .buffer
-                .iter_at_offset(a.offset() + typed.chars().count() as i32);
+            let mut b = self.0.buffer.iter_at_offset(a.offset() + prefix);
             self.0.buffer.delete(&mut a, &mut b);
             self.set_kind(line, kind);
         });
         true
     }
 
-    /// Enter on an empty bullet ends the list.
+    /// Enter on an empty bullet ends the list; in a CRLF note Enter types
+    /// CRLF so the file keeps one kind of line ending.
     fn enter(&self) -> bool {
-        let Some((line, cursor)) = self.cursor_line() else {
-            return false;
-        };
-        let is_bullet = matches!(self.0.view.kind(line), LineKind::Bullet { .. });
-        if is_bullet && cursor.line_offset() == 0 && cursor.ends_line() {
-            self.change(line, line, || self.set_kind(line, LineKind::Text));
+        if let Some((line, cursor)) = self.cursor_line() {
+            let is_bullet = matches!(self.0.view.kind(line), LineKind::Bullet { .. });
+            if is_bullet && cursor.line_offset() == 0 && cursor.ends_line() {
+                self.change(line, line, || self.set_kind(line, LineKind::Text));
+                return true;
+            }
+        }
+        if self.newline() == Eol::CrLf {
+            let buffer = &self.0.buffer;
+            buffer.delete_selection(true, true);
+            buffer.insert_interactive_at_cursor("\r\n", true);
+            self.scroll_to_cursor();
             return true;
         }
         false
@@ -1608,10 +1662,9 @@ impl Editor {
         last_spans.extend(right);
         pasted[n - 1].spans = markdown::merge(last_spans);
         pasted[n - 1].eol = current.eol;
+        let newline = self.newline();
         for line in pasted.iter_mut().take(n - 1) {
-            if line.eol == Eol::None {
-                line.eol = Eol::Lf;
-            }
+            line.eol = newline;
         }
 
         let line_start = self.line_start(line).offset();
@@ -1711,10 +1764,16 @@ impl Editor {
                     gdk::EventType::ButtonPress => {
                         editor.0.state.borrow_mut().pointer_down = true;
                         editor.hide_toolbar();
+                        editor.no_drag_and_drop(event);
                     }
                     gdk::EventType::ButtonRelease => {
                         editor.0.state.borrow_mut().pointer_down = false;
                         editor.schedule_toolbar();
+                    }
+                    // a release can get lost (say, to a drag); typing means
+                    // the mouse is not selecting any more
+                    gdk::EventType::KeyPress => {
+                        editor.0.state.borrow_mut().pointer_down = false;
                     }
                     _ => {}
                 }
@@ -1723,17 +1782,68 @@ impl Editor {
         });
         self.0.view.add_controller(legacy);
 
+        // hidden while scrolling, back once it stops
         if let Some(adjustment) = self.0.view.vadjustment() {
             let weak = self.downgrade();
             adjustment.connect_value_changed(move |_| {
                 if let Some(editor) = upgrade(&weak)
-                    && editor.0.toolbar.is_visible()
+                    && editor.0.buffer.has_selection()
                 {
                     editor.hide_toolbar();
                     editor.schedule_toolbar();
                 }
             });
         }
+        // typing over or deleting the selection removes it without moving
+        // a mark, so watch the selection itself
+        let weak = self.downgrade();
+        self.0.buffer.connect_has_selection_notify(move |_| {
+            if let Some(editor) = upgrade(&weak) {
+                editor.schedule_toolbar();
+            }
+        });
+    }
+
+    /// Pressing inside the selection would start dragging the text (which
+    /// drops its formatting and leaves the toolbar stuck): collapse the
+    /// selection at the click instead, so a drag selects anew.
+    fn no_drag_and_drop(&self, event: &gdk::Event) {
+        let Some(button) = event.downcast_ref::<gdk::ButtonEvent>() else {
+            return;
+        };
+        if button.button() != gdk::BUTTON_PRIMARY
+            || event
+                .modifier_state()
+                .contains(gdk::ModifierType::SHIFT_MASK)
+        {
+            return;
+        }
+        let Some((start, end)) = self.0.buffer.selection_bounds() else {
+            return;
+        };
+        let view = &self.0.view;
+        let (Some((x, y)), Some(native)) = (event.position(), view.native()) else {
+            return;
+        };
+        let (sx, sy) = native.surface_transform();
+        let point = graphene::Point::new((x - sx) as f32, (y - sy) as f32);
+        let Some(p) = native.compute_point(view, &point) else {
+            return;
+        };
+        let (bx, by) =
+            view.window_to_buffer_coords(gtk::TextWindowType::Widget, p.x() as i32, p.y() as i32);
+        if let Some(iter) = view.iter_at_location(bx, by)
+            && iter >= start
+            && iter < end
+        {
+            self.0.buffer.place_cursor(&iter);
+        }
+    }
+
+    /// Shows the toolbar again if there is a selection (say, after the
+    /// window was hidden and shown).
+    pub fn refresh_toolbar(&self) {
+        self.schedule_toolbar();
     }
 
     /// Hides the toolbar at once; shows it again once the selection settles.
@@ -1803,10 +1913,23 @@ impl Editor {
                 gdk::Rectangle::new(x, y, width.max(1), 1),
             )
         } else {
-            (
-                gtk::PositionType::Bottom,
-                gdk::Rectangle::new(x, y + height as i32, width.max(1), 1),
-            )
+            // no room above (the line is at the top, maybe half scrolled
+            // out): go under the end of the selection, never on top of it
+            let end_glyphs = view.iter_location(&end);
+            let (ey, eh) = view.glyph_box(&end_glyphs);
+            let (_, ey) = view.buffer_to_window_coords(gtk::TextWindowType::Widget, 0, ey as i32);
+            let below = ey + eh as i32;
+            if below + toolbar_height <= view.height() {
+                (
+                    gtk::PositionType::Bottom,
+                    gdk::Rectangle::new(x, below.max(y + height as i32), width.max(1), 1),
+                )
+            } else {
+                (
+                    gtk::PositionType::Top,
+                    gdk::Rectangle::new(x, view.height(), width.max(1), 1),
+                )
+            }
         };
         self.update_toolbar_state();
         self.0.toolbar.set_position(position);
@@ -1845,7 +1968,7 @@ impl Editor {
         self.replace_lines(0, 1, lines);
         let cursor = cursor.clamp(0, buffer.char_count());
         buffer.place_cursor(&buffer.iter_at_offset(cursor));
-        self.0.view.scroll_mark_onscreen(&buffer.get_insert());
+        self.scroll_to_cursor();
     }
 
     /// Opens a file. `managed` notes (inside the notes folder) are renamed
@@ -1855,11 +1978,14 @@ impl Editor {
         let text = std::fs::read_to_string(path)?;
         let lines = markdown::parse(&text);
         let final_eol = lines.last().map_or(Eol::None, |l| l.eol);
+        let crlf = lines.iter().filter(|l| l.eol == Eol::CrLf).count();
+        let lf = lines.iter().filter(|l| l.eol == Eol::Lf).count();
         self.0.state.borrow_mut().doc = Some(Doc {
             path: Some(path.to_path_buf()),
             managed,
             created: false,
             final_eol,
+            newline: if crlf > lf { Eol::CrLf } else { Eol::Lf },
             saved: text.clone(),
             dirty: false,
         });
@@ -1867,7 +1993,7 @@ impl Editor {
         // cursor at the end of the text, not after a trailing newline
         let buffer = &self.0.buffer;
         buffer.place_cursor(&buffer.end_iter());
-        self.0.view.scroll_mark_onscreen(&buffer.get_insert());
+        self.scroll_to_cursor();
         self.emit_status();
         Ok(())
     }
@@ -1880,6 +2006,7 @@ impl Editor {
             managed: true,
             created: true,
             final_eol: Eol::Lf,
+            newline: Eol::Lf,
             saved: String::new(),
             dirty: false,
         });
@@ -2049,7 +2176,10 @@ impl Editor {
             let Some(doc) = state.doc.as_ref() else {
                 return;
             };
-            if doc.path.as_deref() != Some(path)
+            if !doc
+                .path
+                .as_deref()
+                .is_some_and(|p| storage::same_file(p, path))
                 || doc.dirty
                 || state.writing
                 || state.save_timer.is_some()
@@ -2371,6 +2501,41 @@ mod tests {
         editor.undo();
         editor.close();
         assert!(!dir.join("x.md").exists());
+
+        // undo goes back a word at a time, not a whole sentence
+        editor.new_note();
+        type_text(&editor, "Words\nfirst second third");
+        editor.undo();
+        assert_eq!(editor.text(), "# Words\nfirst second\n");
+        editor.undo();
+        assert_eq!(editor.text(), "# Words\nfirst\n");
+        editor.redo();
+        editor.redo();
+        assert_eq!(editor.text(), "# Words\nfirst second third\n");
+
+        // Shift+Tab outside a list types nothing
+        assert!(editor.key(gdk::Key::ISO_Left_Tab, 23, gdk::ModifierType::SHIFT_MASK));
+        assert_eq!(editor.text(), "# Words\nfirst second third\n");
+
+        // undoing a bullet autoformat leaves the literal "- "
+        type_text(&editor, "\n- ");
+        assert!(editor.text().ends_with("\n- \n"), "{:?}", editor.text());
+        assert!(matches!(editor.0.view.kind(2), LineKind::Bullet { .. }));
+        editor.undo();
+        assert_eq!(editor.0.view.kind(2), LineKind::Text);
+        type_text(&editor, "x");
+        assert!(editor.text().ends_with("\\- x\n"), "{:?}", editor.text());
+        editor.close();
+
+        // a CRLF note stays CRLF when typing Enter and pasting
+        let crlf = temp_dir("crlf").join("dos.md");
+        std::fs::write(&crlf, "# Dos\r\nline\r\n").unwrap();
+        editor.open(&crlf, false).unwrap();
+        type_text(&editor, "\nnew");
+        editor.paste("a\nb");
+        editor.save_sync();
+        let saved = std::fs::read_to_string(&crlf).unwrap();
+        assert_eq!(saved, "# Dos\r\nline\r\nnewa\r\nb\r\n");
 
         // performance: a 5 000 line note
         let mut big = String::new();

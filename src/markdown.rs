@@ -703,12 +703,30 @@ fn render(kind: LineKind, spans: &[Span], mode: Mode) -> String {
             }
             right[i] = next;
         }
+        // markup every character of a whitespace run has itself: spaces stay
+        // inside a run only if they were formatted too (`**a** **b**` stays
+        // two runs, a bolded "a b" stays one)
+        let mut own = vec![Style::NONE; chars.len()];
+        let mut i = 0;
+        while i < chars.len() {
+            if solid[i].is_some() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut shared = Style::MARKUP;
+            while i < chars.len() && solid[i].is_none() {
+                shared = shared.and(chars[i].1);
+                i += 1;
+            }
+            own[start..i].fill(shared);
+        }
         (0..chars.len())
             .map(|i| match solid[i] {
                 _ if !mode.markup => Style::NONE,
                 Some(s) => s,
                 None if i == 0 || i == chars.len() - 1 => Style::NONE,
-                None => left[i].and(right[i]),
+                None => left[i].and(right[i]).and(own[i]),
             })
             .collect()
     };
@@ -820,6 +838,33 @@ pub fn title(src: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// A whole note as the text a reader sees, one line per block, for search
+/// (`Call the **dentist**` matches "the dentist").
+pub fn searchable(src: &str) -> String {
+    let mut out = String::new();
+    for event in Parser::new_ext(src, options()) {
+        match event {
+            Event::Text(t) | Event::Code(t) | Event::InlineHtml(t) | Event::Html(t) => {
+                if !t.starts_with('<') {
+                    out.push_str(&t);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => out.push(' '),
+            Event::End(
+                TagEnd::Paragraph
+                | TagEnd::Heading(_)
+                | TagEnd::Item
+                | TagEnd::CodeBlock
+                | TagEnd::HtmlBlock
+                | TagEnd::TableCell
+                | TagEnd::BlockQuote(_),
+            ) if !out.ends_with('\n') => out.push('\n'),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Inline Markdown to plain text (`**a** b` -> `a b`).
@@ -959,8 +1004,18 @@ mod tests {
             "a</u>b\n",
             "**a\n",
             "_intra_word and in*tra*word\n",
+            "**a** **b**\n",
+            "*a* *b* and _c_ _d_\n",
+            "<u>a</u> <u>b</u>\n",
         ] {
             round_trip(src);
+        }
+        for src in ["**a** **b**", "*a* *b*", "_a_ _b_", "<u>a</u> <u>b</u>"] {
+            assert_ne!(
+                parse(src)[0].kind,
+                LineKind::Raw,
+                "{src} should show formatted"
+            );
         }
         let line = &parse("__a__ _b_\n")[0];
         assert!(line.spans[0].style.has(Style::BOLD.with(Style::BOLD_US)));
@@ -1206,6 +1261,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn search_sees_rendered_text() {
+        let text = searchable("# Things\nCall the **dentist** before <u>Friday</u>.\n- a *b*\n");
+        assert!(text.contains("Call the dentist before Friday."), "{text:?}");
+        assert!(text.contains("a b"), "{text:?}");
+        assert!(!text.contains("**"));
     }
 
     #[test]

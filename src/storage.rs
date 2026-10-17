@@ -73,7 +73,8 @@ fn note_from(path: PathBuf, text: &str, modified: SystemTime, len: u64) -> Note 
     let title = markdown::title(text)
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| stem(&path));
-    let haystack = format!("{title}\n{text}").to_lowercase();
+    // match what the note shows, and the raw Markdown as a fallback
+    let haystack = format!("{title}\n{}\n{text}", markdown::searchable(text)).to_lowercase();
     Note {
         path,
         title,
@@ -124,10 +125,23 @@ pub fn unique_path(dir: &Path, slug: &str, current: Option<&Path>) -> PathBuf {
             format!("{slug}-{n}.md")
         };
         let candidate = dir.join(name);
-        if current == Some(candidate.as_path()) || !candidate.exists() {
+        // `current` may be spelled differently (a symlinked folder): it is
+        // the same file if both resolve to the same place
+        if current.is_some_and(|c| same_file(c, &candidate)) || !candidate.exists() {
             return candidate;
         }
         n += 1;
+    }
+}
+
+/// Do two paths name the same file, however they are spelled?
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -232,6 +246,22 @@ mod tests {
         assert_eq!(
             unique_path(&dir, "a", Some(&dir.join("a-2.md"))),
             dir.join("a-2.md")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unique_path_sees_through_symlinks() {
+        let dir = temp_dir("symlink");
+        let real = dir.join("notes");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("a.md"), "# A\n").unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // the note was opened through the link; its name must not change
+        assert_eq!(
+            unique_path(&real, "a", Some(&link.join("a.md"))),
+            real.join("a.md")
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

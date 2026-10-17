@@ -23,6 +23,7 @@ struct Callbacks {
 
 struct Inner {
     root: gtk::Box,
+    empty: gtk::Label,
     search: gtk::Text,
     grid: gtk::FlowBox,
     palette: gtk::Popover,
@@ -90,9 +91,18 @@ impl Home {
             .valign(gtk::Align::Start)
             .css_classes(["grid"])
             .build();
+        // shown instead of cards when there is nothing to list
+        let empty = gtk::Label::builder()
+            .css_classes(["empty"])
+            .halign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        list.append(&grid);
+        list.append(&empty);
         let scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
-            .child(&grid)
+            .child(&list)
             .vexpand(true)
             .build();
 
@@ -135,6 +145,7 @@ impl Home {
 
         let home = Home(Rc::new(Inner {
             root,
+            empty,
             search,
             grid,
             palette,
@@ -225,6 +236,15 @@ impl Home {
             }
         });
 
+        // a menu left open while the cards scroll would end up on top of
+        // another card: close it as soon as the list moves
+        let weak = Rc::downgrade(&home.0);
+        scroller.vadjustment().connect_value_changed(move |_| {
+            if let Some(home) = upgrade(&weak) {
+                home.close_popovers();
+            }
+        });
+
         let right_click = gtk::GestureClick::builder()
             .button(gdk::BUTTON_SECONDARY)
             .build();
@@ -303,6 +323,15 @@ impl Home {
 
     fn emit_count(&self) {
         let count = self.visible_count();
+        let empty = &self.0.empty;
+        if count == 0 {
+            empty.set_text(if self.0.notes.borrow().is_empty() {
+                "No notes yet. Press + to start one."
+            } else {
+                "Nothing matches your search."
+            });
+        }
+        empty.set_visible(count == 0);
         if let Some(f) = &self.0.callbacks.borrow().count {
             f(count);
         }
@@ -395,15 +424,18 @@ impl Home {
         open
     }
 
+    /// Enter in the search: a note whose title matches beats one that only
+    /// mentions the words somewhere.
     fn open_first_match(&self) {
         let query = self.0.search.text().to_lowercase();
-        let path = self
-            .0
-            .notes
-            .borrow()
+        let query = query.trim();
+        let notes = self.0.notes.borrow();
+        let path = notes
             .iter()
-            .find(|n| n.matches(query.trim()))
+            .find(|n| n.title.to_lowercase().contains(query))
+            .or_else(|| notes.iter().find(|n| n.matches(query)))
             .map(|n| n.path.clone());
+        drop(notes);
         if let Some(path) = path
             && let Some(f) = &self.0.callbacks.borrow().open
         {

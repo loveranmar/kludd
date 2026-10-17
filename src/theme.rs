@@ -141,6 +141,8 @@ window.kludd {
 .card .t { font-size: 14px; font-weight: 500; line-height: 19.6px; margin-bottom: 1px; }
 .card .d { font-size: 11px; opacity: 0.7; line-height: 16px; }
 .empty { font-size: 13px; opacity: 0.6; margin-top: 24px; }
+/* room under the last card so it never touches the status bar */
+.grid { margin-bottom: 12px; }
 
 /* editor view */
 .editor-view { padding: 20px 24px 0 24px; }
