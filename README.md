@@ -12,11 +12,11 @@
 
 ## What is Kludd?
 
-Kludd starts once when you log in and waits in a Hyprland special workspace, so pressing <kbd>Home</kbd> shows it instantly: no startup, no loading. You write in rich text (bold, lists, headings) and every note is saved as a plain `.md` file in `~/Kludd`. Markdown that Kludd doesn't understand, like code blocks, tables and links, is kept exactly as you wrote it.
+Kludd starts once when you log in and waits in the background, so pressing <kbd>Home</kbd> shows it right away: no startup, no loading. You write in rich text (bold, lists, headings) and every note is saved as a plain `.md` file in `~/Kludd`. Markdown that Kludd doesn't understand, like code blocks, tables and links, is kept exactly as you wrote it.
 
 ## Features
 
-- **Instant** — Kludd keeps running in the background; the hotkey just toggles its workspace
+- **Instant** — Kludd keeps running in the background; the hotkey just shows its window
 - **Plain files** — one note is one `.md` file named after its title; no database, no index, no frontmatter
 - **Rich text, real Markdown** — bold, italic, underline, bullets and headings while you type, saved as normal Markdown
 - **Never mangles a note** — anything unsupported is shown as plain text and written back byte for byte (round-trip tested)
@@ -47,20 +47,19 @@ Kludd is not on the AUR yet. The PKGBUILD lives in [`packaging/`](packaging/PKGB
 
 ## Hyprland setup
 
-Add this to your Hyprland config. It uses the block window rules of Hyprland 0.53 and newer:
+Add this to your Hyprland config (block window rules, Hyprland 0.53 and newer):
 
 ```ini
-# Start Kludd once, hidden in its own special workspace
-exec-once = [workspace special:kludd silent] kludd --hidden
+# Start Kludd once, in the background
+exec-once = kludd --hidden
 
-# Home shows and hides it
-bind = , Home, togglespecialworkspace, kludd
+# Home shows Kludd, or hides it when it is in front
+bind = , Home, exec, kludd --toggle
 
 # Kludd draws its own rounded border, so Hyprland's is switched off
 windowrule {
     name = kludd
     match:class = ^(io\.github\.loveranmar\.Kludd)$
-    workspace = special:kludd silent
     float = true
     center = true
     size = 560 460
@@ -68,12 +67,12 @@ windowrule {
     rounding = 0
     no_shadow = true
     no_blur = true
-    no_dim = true
+    no_anim = true
     opacity = 1.0 override 1.0 override
 }
 ```
 
-If you used `install.sh`, `~/.local/bin` may not be on Hyprland's `PATH`; write `~/.local/bin/kludd` as the full path (`/home/you/.local/bin/kludd`) in the `exec-once` line. When `special:kludd` opens, Kludd focuses itself through Hyprland's event socket, so you can start typing right away. Closing the window (say, your `killactive` bind) hides Kludd instead of quitting it, so <kbd>Home</kbd> stays instant; `kludd --quit` quits for real.
+Kludd keeps running in the background with its window hidden, so the hotkey only has to show it. Closing the window (say, your `killactive` bind) hides it again; `kludd --quit` quits for real. If you used `install.sh`, `~/.local/bin` may not be on Hyprland's `PATH`; then write the full path, `/home/you/.local/bin/kludd`.
 
 To open `.md` files with Kludd by default, run `xdg-mime default kludd.desktop text/markdown`.
 
@@ -81,7 +80,7 @@ To open `.md` files with Kludd by default, run `xdg-mime default kludd.desktop t
 
 | Keys | Action |
 |------|--------|
-| <kbd>Home</kbd> | Show or hide Kludd (the Hyprland bind above) |
+| <kbd>Home</kbd> | Show Kludd, or hide it (the Hyprland bind above) |
 | <kbd>Ctrl</kbd>+<kbd>N</kbd> | New note |
 | <kbd>Ctrl</kbd>+<kbd>F</kbd> | Search notes (or just start typing on the notes view) |
 | <kbd>Esc</kbd> | Back to the notes, or hide Kludd |
@@ -96,7 +95,7 @@ To open `.md` files with Kludd by default, run `xdg-mime default kludd.desktop t
 
 Typing `- ` or `* ` at the start of a line makes a bullet, `# ` and `## ` make headings, and Enter on an empty bullet ends the list. Select text to get the floating **B** *I* <u>U</u> • H1 H2 toolbar.
 
-From a terminal, `kludd` shows the running Kludd, `kludd file.md` opens a file in it, and `kludd --quit` saves and quits.
+From a terminal, `kludd` shows the running Kludd, `kludd file.md` opens a file in it, `kludd --toggle` shows or hides it, and `kludd --quit` saves and quits.
 
 ## Configuration
 

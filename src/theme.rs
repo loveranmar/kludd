@@ -1,8 +1,9 @@
 //! Colour themes, the stylesheet and the tiny stroke-icon widget.
 //!
-//! All colours derive from two values: `@paper` (background) and `@ink`
-//! (text and accents). The base stylesheet only ever refers to those two
-//! names; switching theme regenerates the small provider that defines them.
+//! Colours come from three values per theme: `@paper` (background), `@ink`
+//! (text and accents) and `@accent` (the selection). The base stylesheet only
+//! refers to those names; switching theme regenerates the small provider
+//! that defines them.
 
 use std::cell::{Cell, RefCell};
 
@@ -14,6 +15,9 @@ pub struct Theme {
     pub name: &'static str,
     pub paper: &'static str,
     pub ink: &'static str,
+    /// Selection highlight: a saturated take on the paper colour, clearly
+    /// visible behind ink text.
+    pub accent: &'static str,
 }
 
 pub const THEMES: [Theme; 6] = [
@@ -21,33 +25,45 @@ pub const THEMES: [Theme; 6] = [
         name: "pink",
         paper: "#FFD6E5",
         ink: "#4A1F30",
+        accent: "#F79BC0",
     },
     Theme {
         name: "yellow",
         paper: "#FFF3B0",
         ink: "#3A3320",
+        accent: "#F2D45C",
     },
     Theme {
         name: "mint",
         paper: "#D4F5E4",
         ink: "#173A2A",
+        accent: "#8EDDB5",
     },
     Theme {
         name: "lavender",
         paper: "#E4DCFF",
         ink: "#2A2350",
+        accent: "#B4A3FF",
     },
     Theme {
         name: "sky",
         paper: "#D6ECFF",
         ink: "#14304D",
+        accent: "#94C7FF",
     },
     Theme {
         name: "dark",
         paper: "#1E1E24",
         ink: "#ECEAF2",
+        accent: "#5B5BD6",
     },
 ];
+
+impl Theme {
+    pub fn accent_rgba(&self) -> gdk::RGBA {
+        gdk::RGBA::parse(self.accent).unwrap_or(gdk::RGBA::BLACK)
+    }
+}
 
 pub fn by_name(name: &str) -> &'static Theme {
     THEMES.iter().find(|t| t.name == name).unwrap_or(&THEMES[0])
@@ -115,7 +131,7 @@ window.kludd {
   caret-color: @ink;
 }
 .search text > placeholder { color: @ink; opacity: 1; }
-.search text selection { background-color: alpha(@ink, 0.32); color: @ink; }
+.search text selection { background-color: @accent; color: @ink; }
 .card {
   background-color: alpha(@ink, 0.07);
   border-radius: 14px;
@@ -221,10 +237,11 @@ impl Styles {
     /// Regenerates the colour (and editor size) definitions.
     pub fn update(&self, theme: &Theme, zoom: f64) {
         self.dynamic.load_from_string(&format!(
-            "@define-color paper {};\n@define-color ink {};\n\
+            "@define-color paper {};\n@define-color ink {};\n@define-color accent {};\n\
              textview.editor, textview.editor > text {{ font-size: {:.2}px; }}\n",
             theme.paper,
             theme.ink,
+            theme.accent,
             15.0 * zoom
         ));
     }

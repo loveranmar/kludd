@@ -424,9 +424,9 @@ fn circle(icon: &str, class: &str, label: &str) -> gtk::Button {
     button
 }
 
-/// Popovers never grab the pointer: a grabbing xdg_popup is refused when
-/// the window is not focused yet (for example right after Hyprland toggles
-/// the special workspace), and the popover would vanish at once.
+/// Popovers never grab the pointer: a grabbing popover captures all input
+/// while it is open, and if the compositor refuses the grab (the window is
+/// not focused yet) it vanishes at once. Clicks elsewhere close them instead.
 fn popover(classes: &[&str], position: gtk::PositionType) -> gtk::Popover {
     let popover = gtk::Popover::builder()
         .has_arrow(false)

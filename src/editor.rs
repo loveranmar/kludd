@@ -40,6 +40,8 @@ mod imp {
         /// a long note only serializes what was edited.
         pub cache: RefCell<Vec<Option<String>>>,
         pub zoom: Cell<f64>,
+        /// Selection colour of the current theme.
+        pub accent: RefCell<Option<gdk::RGBA>>,
     }
 
     #[glib::object_subclass]
@@ -119,50 +121,103 @@ impl View {
         (rect.y() as f32 - 1.0, rect.height() as f32 + 1.0)
     }
 
+    /// The whole line box (glyphs plus line spacing) around a glyph box, so
+    /// consecutive selected lines meet without gaps.
+    fn line_box(&self, rect: &gdk::Rectangle) -> (f32, f32) {
+        let glyphs = rect.height() as f32;
+        let full = glyphs * LINE_HEIGHT as f32;
+        let top = rect.y() as f32 - (full - glyphs) / 2.0;
+        (top.floor(), (top + full).ceil() - top.floor() + 1.0)
+    }
+
+    /// Right edge of the text on the display line `[line, content_end)`.
+    fn text_right(&self, line: &gtk::TextIter, content_end: &gtk::TextIter) -> i32 {
+        if content_end <= line {
+            return self.iter_location(line).x();
+        }
+        let mut last = *content_end;
+        last.backward_char();
+        let r = self.iter_location(&last);
+        r.x() + r.width()
+    }
+
+    /// Draws the selection as rounded blocks in the theme's accent colour,
+    /// one per display line: snug around the glyphs for a one-line
+    /// selection (as in the design), full line height when it spans lines
+    /// so it reads as one block. Selected line breaks and empty lines get a
+    /// small block too.
     fn draw_selection(&self, snapshot: &gtk::Snapshot) {
         let buffer = self.buffer();
         let Some((start, end)) = buffer.selection_bounds() else {
             return;
         };
-        let mut color = self.color();
-        // 32 % ink: the design's 15 % was too faint to see on the pastel themes
-        color.set_alpha(color.alpha() * 0.32);
-        let radius = 4.0 * self.zoom();
+        let Some(color) = *self.imp().accent.borrow() else {
+            return;
+        };
+        let zoom = self.zoom();
+        let radius = 4.0 * zoom;
+        let newline = (5.0 * zoom).round() as i32;
         let visible = self.visible_rect();
-        let (top, _) = self.line_at_y(visible.y());
-        let mut iter = if start < top { top } else { start };
-        loop {
-            let mut line_end = iter;
-            if !self.ends_display_line(&line_end) {
-                self.forward_display_line_end(&mut line_end);
-            }
-            let seg_end = if line_end < end { line_end } else { end };
-            let a = self.iter_location(&iter);
-            if a.y() > visible.y() + visible.height() {
-                break;
-            }
-            let b = self.iter_location(&seg_end);
-            let width = (b.x() - a.x()) as f32;
-            if width > 0.0 {
-                let (y, height) = self.glyph_box(&a);
-                let rect = graphene::Rect::new(a.x() as f32, y, width, height);
-                let rounded = gsk::RoundedRect::from_rect(rect, radius);
-                snapshot.push_rounded_clip(&rounded);
-                snapshot.append_color(&color, &rect);
-                snapshot.pop();
-            }
-            if seg_end >= end || !self.forward_display_line(&mut iter) || iter >= end {
-                break;
-            }
-        }
-    }
+        let bottom = visible.y() + visible.height();
 
-    fn ends_display_line(&self, iter: &gtk::TextIter) -> bool {
-        let mut probe = *iter;
-        if !self.forward_display_line_end(&mut probe) {
-            return true;
+        let mut probe = start;
+        let single = !self.forward_display_line(&mut probe) || probe >= end;
+
+        // first display line that is visible and selected
+        let (top, _) = self.line_at_y(visible.y());
+        let mut line = if start > top { start } else { top };
+        if !self.starts_display_line(&line) {
+            self.backward_display_line_start(&mut line);
         }
-        probe == *iter
+        loop {
+            let mut next = line;
+            let last_line = !self.forward_display_line(&mut next) || next <= line;
+            if last_line {
+                next = buffer.end_iter();
+            }
+            // text on this display line ends before its line break, if any
+            let mut content_end = next;
+            if !last_line && next.line() > line.line() {
+                content_end = line;
+                if !content_end.ends_line() {
+                    content_end.forward_to_line_end();
+                }
+            }
+            let loc = self.iter_location(&line);
+            if loc.y() > bottom {
+                break;
+            }
+            let a = if start > line { start } else { line };
+            let b = if end < next { end } else { next };
+            if a < b {
+                let x1 = self.iter_location(&a).x();
+                let mut x2 = if b < content_end {
+                    self.iter_location(&b).x()
+                } else {
+                    self.text_right(&line, &content_end)
+                };
+                // the line break itself is selected
+                if end > content_end && content_end < next {
+                    x2 += newline;
+                }
+                if x2 > x1 {
+                    let glyphs = self.iter_location(&a);
+                    let (y, height) = if single {
+                        self.glyph_box(&glyphs)
+                    } else {
+                        self.line_box(&glyphs)
+                    };
+                    let rect = graphene::Rect::new(x1 as f32, y, (x2 - x1) as f32, height);
+                    snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(rect, radius));
+                    snapshot.append_color(&color, &rect);
+                    snapshot.pop();
+                }
+            }
+            if last_line || next >= end {
+                break;
+            }
+            line = next;
+        }
     }
 
     fn draw_bullets(&self, snapshot: &gtk::Snapshot) {
@@ -328,6 +383,8 @@ struct State {
     doc: Option<Doc>,
     save_timer: Option<glib::SourceId>,
     toolbar_timer: Option<glib::SourceId>,
+    /// A mouse button is down in the text: a selection is being dragged.
+    pointer_down: bool,
     writing: bool,
     save_again: bool,
 }
@@ -427,6 +484,7 @@ impl Editor {
         editor.build_toolbar();
         editor.connect_buffer();
         editor.connect_keys();
+        editor.connect_pointer();
         editor.connect_clipboard();
         let weak = editor.downgrade();
         back.connect_clicked(move |_| {
@@ -481,10 +539,34 @@ impl Editor {
         }
     }
 
+    pub fn set_accent(&self, accent: gdk::RGBA) {
+        self.0.view.imp().accent.replace(Some(accent));
+        self.0.view.queue_draw();
+    }
+
     pub fn set_zoom(&self, zoom: f64) {
         self.0.view.imp().zoom.set(zoom);
         self.0.tags.set_zoom(zoom);
+        self.relayout();
+    }
+
+    /// After the text changed size: redraw once GTK has laid it out again
+    /// (bullets and the selection are drawn from the new line positions),
+    /// and move the toolbar to where the selection is now.
+    fn relayout(&self) {
         self.0.view.queue_draw();
+        for delay in [40, 200] {
+            let weak = self.downgrade();
+            glib::timeout_add_local_once(Duration::from_millis(delay), move || {
+                if let Some(editor) = upgrade(&weak) {
+                    editor.0.view.queue_draw();
+                }
+            });
+        }
+        if self.0.toolbar.is_visible() {
+            self.0.toolbar.popdown();
+            self.schedule_toolbar();
+        }
     }
 
     // -- line model ----------------------------------------------------------
@@ -1050,6 +1132,7 @@ impl Editor {
                 at: Instant::now(),
             });
             self.changed();
+            self.relayout();
         }
     }
 
@@ -1074,6 +1157,7 @@ impl Editor {
             at: Instant::now(),
         });
         self.changed();
+        self.relayout();
     }
 
     fn push_step(&self, step: Step) {
@@ -1107,6 +1191,7 @@ impl Editor {
         self.place_cursor(step.cursor_before);
         self.0.state.borrow_mut().redo.push(step);
         self.changed();
+        self.relayout();
     }
 
     pub fn redo(&self) {
@@ -1117,6 +1202,7 @@ impl Editor {
         self.place_cursor(step.cursor_after);
         self.0.state.borrow_mut().undo.push(step);
         self.changed();
+        self.relayout();
     }
 
     fn place_cursor(&self, offset: i32) {
@@ -1561,52 +1647,110 @@ impl Editor {
         self.0.toolbar.set_child(Some(&row));
     }
 
-    /// Hide the toolbar at once; show it once the selection settles.
+    /// The toolbar follows the selection, but never while the mouse is
+    /// still dragging one out or the text is scrolling.
+    fn connect_pointer(&self) {
+        let legacy = gtk::EventControllerLegacy::new();
+        legacy.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = self.downgrade();
+        legacy.connect_event(move |_, event| {
+            if let Some(editor) = upgrade(&weak) {
+                match event.event_type() {
+                    gdk::EventType::ButtonPress => {
+                        editor.0.state.borrow_mut().pointer_down = true;
+                        editor.hide_toolbar();
+                    }
+                    gdk::EventType::ButtonRelease => {
+                        editor.0.state.borrow_mut().pointer_down = false;
+                        editor.schedule_toolbar();
+                    }
+                    _ => {}
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        self.0.view.add_controller(legacy);
+
+        if let Some(adjustment) = self.0.view.vadjustment() {
+            let weak = self.downgrade();
+            adjustment.connect_value_changed(move |_| {
+                if let Some(editor) = upgrade(&weak)
+                    && editor.0.toolbar.is_visible()
+                {
+                    editor.hide_toolbar();
+                    editor.schedule_toolbar();
+                }
+            });
+        }
+    }
+
+    /// Hides the toolbar at once; shows it again once the selection settles.
     fn schedule_toolbar(&self) {
-        let mut state = self.0.state.borrow_mut();
-        if let Some(id) = state.toolbar_timer.take() {
+        if let Some(id) = self.0.state.borrow_mut().toolbar_timer.take() {
             id.remove();
         }
-        if !self.0.buffer.has_selection() {
-            drop(state);
-            if self.0.toolbar.is_visible() {
-                self.0.toolbar.popdown();
-            }
+        let dragging = self.0.state.borrow().pointer_down;
+        if !self.0.buffer.has_selection() || dragging {
+            self.0.toolbar.popdown();
             return;
         }
         let weak = self.downgrade();
-        state.toolbar_timer = Some(glib::timeout_add_local_once(
-            Duration::from_millis(180),
-            move || {
-                if let Some(editor) = upgrade(&weak) {
-                    editor.0.state.borrow_mut().toolbar_timer = None;
-                    editor.show_toolbar();
-                }
-            },
-        ));
+        let id = glib::timeout_add_local_once(Duration::from_millis(120), move || {
+            if let Some(editor) = upgrade(&weak) {
+                editor.0.state.borrow_mut().toolbar_timer = None;
+                editor.show_toolbar();
+            }
+        });
+        self.0.state.borrow_mut().toolbar_timer = Some(id);
     }
 
     fn show_toolbar(&self) {
         let view = &self.0.view;
-        let Some((start, _)) = self.0.buffer.selection_bounds() else {
+        let Some((start, end)) = self.0.buffer.selection_bounds() else {
             return;
         };
-        if !view.is_mapped() {
+        if !view.is_mapped() || self.0.state.borrow().pointer_down {
             return;
         }
-        // like the design: starts just right of the selection start, above it
-        let a = view.iter_location(&start);
-        let (y, _) = view.glyph_box(&a);
-        let (x, y) = view.buffer_to_window_coords(gtk::TextWindowType::Widget, a.x(), y as i32);
+        // anchor on the first selected line that is on screen
+        let visible = view.visible_rect();
+        let (top, _) = view.line_at_y(visible.y());
+        let first = if start > top { start } else { top };
+        if first >= end {
+            self.0.toolbar.popdown();
+            return;
+        }
+        let glyphs = view.iter_location(&first);
+        let (y, height) = view.glyph_box(&glyphs);
+        let (x, y) =
+            view.buffer_to_window_coords(gtk::TextWindowType::Widget, glyphs.x(), y as i32);
+        if y > view.height() {
+            self.0.toolbar.popdown();
+            return;
+        }
         // a popover measures as 0; its row plus the 6px side padding is the width
-        let width = self
-            .0
-            .toolbar
-            .child()
-            .map_or(0, |c| c.measure(gtk::Orientation::Horizontal, -1).1)
-            + 12;
+        let (width, toolbar_height) = self.0.toolbar.child().map_or((0, 0), |c| {
+            (
+                c.measure(gtk::Orientation::Horizontal, -1).1 + 12,
+                c.measure(gtk::Orientation::Vertical, -1).1 + 8,
+            )
+        });
+        // like the design: just right of the selection start, above it;
+        // below the line when there is no room above
         let x = (x + 7).min(view.width() - width).max(0);
-        let rect = gdk::Rectangle::new(x, y, width.max(1), 1);
+        let room_above = y >= toolbar_height + 2;
+        let (position, rect) = if room_above {
+            (
+                gtk::PositionType::Top,
+                gdk::Rectangle::new(x, y, width.max(1), 1),
+            )
+        } else {
+            (
+                gtk::PositionType::Bottom,
+                gdk::Rectangle::new(x, y + height as i32, width.max(1), 1),
+            )
+        };
+        self.0.toolbar.set_position(position);
         self.0.toolbar.set_pointing_to(Some(&rect));
         if self.0.toolbar.is_visible() {
             self.0.toolbar.present();

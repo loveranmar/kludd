@@ -1,5 +1,5 @@
-//! The application: one window, two views, a status bar, and the glue to
-//! Hyprland's special workspace.
+//! The application: one window, two views and a status bar. Kludd stays
+//! running with its window hidden; `--toggle` (the hotkey) shows it.
 
 use std::cell::{Cell, RefCell};
 use std::ops::ControlFlow;
@@ -35,6 +35,16 @@ thread_local! {
 }
 
 pub fn run() -> glib::ExitCode {
+    // `--quit` must never start Kludd itself: ask a running copy through a
+    // launcher-only application, which cannot become the primary instance
+    if std::env::args().skip(1).any(|a| a == "--quit") {
+        let launcher = gio::Application::new(Some(app_id()), gio::ApplicationFlags::IS_LAUNCHER);
+        if launcher.register(gio::Cancellable::NONE).is_ok() && launcher.is_remote() {
+            launcher.activate_action("quit", None);
+        }
+        return glib::ExitCode::SUCCESS;
+    }
+
     let app = gtk::Application::builder()
         .application_id(app_id())
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
@@ -44,7 +54,15 @@ pub fn run() -> glib::ExitCode {
         glib::Char::from(0),
         glib::OptionFlags::NONE,
         glib::OptionArg::None,
-        "Start in the background (for Hyprland exec-once)",
+        "Start in the background without showing the window (for exec-once)",
+        None,
+    );
+    app.add_main_option(
+        "toggle",
+        glib::Char::from(0),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::None,
+        "Show the window, or hide it if it is focused (for a hotkey)",
         None,
     );
     app.add_main_option(
@@ -56,10 +74,11 @@ pub fn run() -> glib::ExitCode {
         None,
     );
     app.connect_handle_local_options(|app, options| {
-        if options.contains("quit") {
-            if app.register(gio::Cancellable::NONE).is_ok() && app.is_remote() {
-                app.activate_action("quit", None);
-            }
+        if options.contains("toggle")
+            && app.register(gio::Cancellable::NONE).is_ok()
+            && app.is_remote()
+        {
+            app.activate_action("toggle", None);
             return ControlFlow::Break(glib::ExitCode::SUCCESS);
         }
         if options.contains("hidden") {
@@ -136,6 +155,7 @@ impl Kludd {
         let home = Home::new();
         let editor = Editor::new(notes_dir);
         editor.set_zoom(config.zoom);
+        editor.set_accent(theme::by_name(&config.theme).accent_rgba());
         home.set_theme(theme::by_name(&config.theme).name);
 
         let stack = gtk::Stack::builder()
@@ -194,7 +214,6 @@ impl Kludd {
         });
         kludd.connect(app);
         kludd.watch_dir();
-        hypr::follow_focus();
         kludd.rescan();
         kludd.start_clock();
         kludd.update_status();
@@ -267,19 +286,14 @@ impl Kludd {
         });
         self.window.add_controller(keys);
 
-        // closing only hides: the hotkey must find Kludd running
+        // closing (Alt+Q, the window's close) only hides: Kludd keeps
+        // running so the hotkey shows it again at once
         let weak = Rc::downgrade(self);
         self.window.connect_close_request(move |_| {
-            let Some(k) = weak.upgrade() else {
-                return glib::Propagation::Proceed;
-            };
-            k.editor.save_sync();
-            if hypr::available() {
+            if let Some(k) = weak.upgrade() {
                 k.hide();
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
             }
+            glib::Propagation::Stop
         });
         let weak = Rc::downgrade(self);
         self.window.connect_is_active_notify(move |window| {
@@ -307,6 +321,15 @@ impl Kludd {
             }
         });
         app.add_action(&quit);
+
+        let toggle = gio::SimpleAction::new("toggle", None);
+        let weak = Rc::downgrade(self);
+        toggle.connect_activate(move |_, _| {
+            if let Some(k) = weak.upgrade() {
+                k.toggle();
+            }
+        });
+        app.add_action(&toggle);
     }
 
     fn key(&self, key: gdk::Key, code: u32, state: gdk::ModifierType) -> bool {
@@ -366,26 +389,30 @@ impl Kludd {
     fn show(&self) {
         let first = !self.shown_once.replace(true);
         if first && START_HIDDEN.get() {
-            // exec-once at login: map the window inside the special
-            // workspace without showing it
-            self.window.present();
+            // started at login: stay in the background until asked
             return;
-        }
-        if hypr::available() && !hypr::special_shown() {
-            hypr::toggle();
         }
         self.window.present();
         self.focus_page();
+        if self.page.get() == Page::Home {
+            self.home.refresh_dates();
+        }
     }
 
     fn hide(&self) {
         self.editor.save_sync();
-        if hypr::available() {
-            if hypr::special_shown() {
-                hypr::toggle();
-            }
+        self.editor.hide_toolbar();
+        self.home.close_popovers();
+        self.window.set_visible(false);
+    }
+
+    /// The hotkey: show Kludd, or hide it when it is already in front.
+    fn toggle(&self) {
+        self.shown_once.set(true);
+        if self.window.is_visible() && self.window.is_active() {
+            self.hide();
         } else {
-            self.window.set_visible(false);
+            self.show();
         }
     }
 
@@ -449,6 +476,7 @@ impl Kludd {
         let mut config = self.config.borrow_mut();
         config.theme = theme.name.to_string();
         self.styles.update(theme, config.zoom);
+        self.editor.set_accent(theme.accent_rgba());
         self.home.set_theme(theme.name);
         if let Err(e) = config.save() {
             eprintln!("kludd: could not save config: {e}");
@@ -599,108 +627,4 @@ fn clock() -> String {
     glib::DateTime::now_local()
         .map(|d| format!("{:02}:{:02}", d.hour(), d.minute()))
         .unwrap_or_default()
-}
-
-/// Hyprland IPC over its request socket; no `hyprctl` process needed.
-mod hypr {
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::os::unix::net::UnixStream;
-    use std::path::PathBuf;
-    use std::sync::OnceLock;
-    use std::time::Duration;
-
-    /// Name of the special workspace (`KLUDD_WORKSPACE` overrides it).
-    fn workspace() -> &'static str {
-        static NAME: OnceLock<String> = OnceLock::new();
-        NAME.get_or_init(|| {
-            std::env::var("KLUDD_WORKSPACE")
-                .ok()
-                .filter(|w| {
-                    !w.is_empty()
-                        && w.chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                })
-                .unwrap_or_else(|| "kludd".into())
-        })
-    }
-
-    fn socket_path(name: &str) -> Option<PathBuf> {
-        let signature = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
-        Some(
-            PathBuf::from(runtime)
-                .join("hypr")
-                .join(signature)
-                .join(name),
-        )
-    }
-
-    fn socket() -> Option<PathBuf> {
-        socket_path(".socket.sock")
-    }
-
-    pub fn available() -> bool {
-        socket().is_some_and(|p| p.exists())
-    }
-
-    fn request(command: &str) -> Option<String> {
-        let mut stream = UnixStream::connect(socket()?).ok()?;
-        // some calls run on the UI thread: never wait on Hyprland for long
-        stream
-            .set_read_timeout(Some(Duration::from_millis(500)))
-            .ok()?;
-        stream
-            .set_write_timeout(Some(Duration::from_millis(500)))
-            .ok()?;
-        stream.write_all(command.as_bytes()).ok()?;
-        let mut reply = String::new();
-        stream.read_to_string(&mut reply).ok()?;
-        Some(reply)
-    }
-
-    /// Is `special:kludd` open on any monitor?
-    pub fn special_shown() -> bool {
-        request("j/monitors").is_some_and(|r| r.contains(&format!("\"special:{}\"", workspace())))
-    }
-
-    pub fn toggle() {
-        request(&format!("dispatch togglespecialworkspace {}", workspace()));
-    }
-
-    /// Is keyboard focus on Kludd while its special workspace is hidden?
-    fn focus_stuck_on_hidden_kludd() -> bool {
-        let Some(active) = request("j/activewindow") else {
-            return false;
-        };
-        active.contains(&format!("\"class\": \"{}\"", super::app_id()))
-            && active.contains(&format!("\"name\": \"special:{}\"", workspace()))
-            && !special_shown()
-    }
-
-    /// Keeps keyboard focus in step with `special:kludd`, from a thread that
-    /// follows Hyprland's event socket:
-    /// - opening it focuses Kludd: Hyprland only refocuses the window it last
-    ///   focused there, and a window started `silent` never was;
-    /// - closing it from inside Kludd (Esc, or Alt+Q / killactive, which
-    ///   Kludd turns into hiding) can leave focus on the now hidden window,
-    ///   so it goes back to the previous one.
-    pub fn follow_focus() {
-        let Some(path) = socket_path(".socket2.sock") else {
-            return;
-        };
-        let opened = format!("activespecial>>special:{},", workspace());
-        let class = format!("^({})$", super::app_id().replace('.', "\\."));
-        std::thread::spawn(move || {
-            let Ok(stream) = UnixStream::connect(path) else {
-                return;
-            };
-            for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                if line.starts_with(&opened) {
-                    request(&format!("dispatch focuswindow class:{class}"));
-                } else if line.starts_with("activespecial>>") && focus_stuck_on_hidden_kludd() {
-                    request("dispatch focuscurrentorlast");
-                }
-            }
-        });
-    }
 }
