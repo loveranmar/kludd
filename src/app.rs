@@ -41,6 +41,10 @@ pub fn run() -> glib::ExitCode {
         let launcher = gio::Application::new(Some(app_id()), gio::ApplicationFlags::IS_LAUNCHER);
         if launcher.register(gio::Cancellable::NONE).is_ok() && launcher.is_remote() {
             launcher.activate_action("quit", None);
+            // the request is queued on D-Bus; send it before this process ends
+            if let Some(bus) = launcher.dbus_connection() {
+                let _ = bus.flush_sync(gio::Cancellable::NONE);
+            }
         }
         return glib::ExitCode::SUCCESS;
     }
