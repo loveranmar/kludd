@@ -1,0 +1,24 @@
+[package]
+name = "kludd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+description = "A dead-fast, cute Markdown notepad for Hyprland"
+repository = "https://github.com/loveranmar/kludd"
+readme = "README.md"
+keywords = ["notes", "markdown", "gtk4", "hyprland", "wayland"]
+categories = ["text-editors"]
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+serde = { version = "1", features = ["derive"] }
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse", "display"] }
+
+[profile.release]
+lto = true
+opt-level = 3
+strip = true
+codegen-units = 1
+panic = "abort"

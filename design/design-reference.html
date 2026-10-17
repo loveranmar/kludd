@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kludd design reference</title>
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/dist/tabler-icons.min.css">
+<style>
+/* Kludd design reference — the GTK app must match this 1:1.
+   Open in a browser. Click swatches to switch themes. */
+:root{--paper:#FFD6E5;--ink:#4A1F30}
+*{box-sizing:border-box}
+body{margin:0;padding:40px;background:#f4f2ee;font-family:'Fredoka',sans-serif;display:flex;flex-direction:column;gap:28px;align-items:flex-start}
+.row{display:flex;gap:28px;flex-wrap:wrap}
+.cap{font:13px system-ui;color:#666;margin-top:8px}
+
+/* Window */
+.w{width:560px;height:460px;background:var(--paper);color:var(--ink);border-radius:22px;border:2px solid color-mix(in srgb,var(--ink) 22%,transparent);position:relative;overflow:hidden}
+.w b{font-weight:500}
+
+/* Status bar (both views) */
+.sb{position:absolute;bottom:0;left:0;right:0;padding:6px 20px;font-family:'JetBrains Mono',monospace;font-size:11px;display:flex;justify-content:space-between;background:color-mix(in srgb,var(--ink) 9%,transparent)}
+
+/* Home view */
+.home{padding:18px 20px}
+.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.head h1{font-size:20px;font-weight:500;margin:0}
+.btns{display:flex;gap:8px}
+.circle{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:16px;border:0;cursor:pointer}
+.circle.primary{background:var(--ink);color:var(--paper)}
+.circle.soft{background:color-mix(in srgb,var(--ink) 7%,transparent);color:var(--ink)}
+.search{background:color-mix(in srgb,var(--ink) 7%,transparent);border-radius:12px;padding:6px 12px;font-size:13px;opacity:.75;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.card{background:color-mix(in srgb,var(--ink) 7%,transparent);border-radius:14px;padding:10px 12px;line-height:1.4}
+.card .t{font-weight:500;font-size:14px;margin-bottom:2px}
+.card .d{font-size:11px;opacity:.7}
+
+/* Color popover (opened from palette button) */
+.pal{position:absolute;top:56px;right:58px;background:var(--ink);border-radius:14px;padding:8px;display:flex;gap:8px}
+.sw{width:26px;height:26px;border-radius:50%;border:1px solid rgba(0,0,0,.15);cursor:pointer;padding:0}
+.sw.on{box-shadow:0 0 0 2px var(--ink),0 0 0 4px var(--paper)}
+
+/* Editor view */
+.ed{padding:20px 24px;font-size:15px;line-height:1.55}
+.notch{position:absolute;top:-1px;left:50%;transform:translateX(-50%);width:70px;height:12px;border-radius:0 0 8px 8px;background:color-mix(in srgb,var(--ink) 16%,transparent)}
+.back{font-size:13px;opacity:.7;margin-bottom:4px}
+.ed h1{font-size:20px;font-weight:500;margin:0 0 26px}
+.ed h2{font-size:17px;font-weight:500;margin:10px 0 4px}
+.sel{background:color-mix(in srgb,var(--ink) 15%,transparent);border-radius:4px}
+.ed ul{margin:4px 0 0;padding-left:20px}
+.tb{position:absolute;top:74px;left:86px;display:flex;gap:2px;background:var(--ink);color:var(--paper);border-radius:10px;padding:4px 6px;font-size:13px}
+.tb span{padding:0 6px}
+</style>
+</head>
+<body>
+
+<div class="row" id="swatches" style="gap:10px;align-items:center;font:13px system-ui;color:#666">Theme:</div>
+
+<div class="row">
+  <div>
+    <div class="w home">
+      <div class="head">
+        <h1>My notes</h1>
+        <div class="btns">
+          <button class="circle soft" aria-label="Theme"><i class="ti ti-palette"></i></button>
+          <button class="circle primary" aria-label="New note"><i class="ti ti-plus"></i></button>
+        </div>
+      </div>
+      <div class="pal" id="pal"></div>
+      <div class="search"><i class="ti ti-search" style="font-size:14px;vertical-align:-2px"></i> Search…</div>
+      <div class="grid">
+        <div class="card"><div class="t">Things to fix</div><div class="d">today 16:12</div></div>
+        <div class="card"><div class="t">Sheetly ideas</div><div class="d">yesterday</div></div>
+        <div class="card"><div class="t">Drone parts</div><div class="d">12 Oct</div></div>
+        <div class="card"><div class="t">Vocab week 42</div><div class="d">10 Oct</div></div>
+      </div>
+      <div class="sb"><span>~/Kludd/</span><span>4 notes</span></div>
+    </div>
+    <div class="cap">Home view (palette popover shown open)</div>
+  </div>
+
+  <div>
+    <div class="w ed">
+      <div class="notch"></div>
+      <div class="back"><i class="ti ti-arrow-left" style="font-size:14px;vertical-align:-2px"></i> Notes</div>
+      <h1>Things to fix</h1>
+      <div class="tb"><span style="font-weight:500">B</span><span style="font-style:italic">I</span><span style="text-decoration:underline">U</span><span>•</span><span>H1</span><span>H2</span></div>
+      <div>Call the <b class="sel">dentist</b> before <u>Friday</u>.</div>
+      <ul><li>Buy milk</li><li>Push to GitHub</li></ul>
+      <h2>Later</h2>
+      <div>Some <i>italic</i> text here.</div>
+      <div class="sb"><span>~/Kludd/things-to-fix.md</span><span>19:39</span></div>
+    </div>
+    <div class="cap">Editor view (format toolbar shown over a selection)</div>
+  </div>
+</div>
+
+<script>
+const themes=[
+ ["pink","#FFD6E5","#4A1F30"],["yellow","#FFF3B0","#3A3320"],["mint","#D4F5E4","#173A2A"],
+ ["lavender","#E4DCFF","#2A2350"],["sky","#D6ECFF","#14304D"],["dark","#1E1E24","#ECEAF2"]];
+function set(i){document.documentElement.style.setProperty('--paper',themes[i][1]);
+ document.documentElement.style.setProperty('--ink',themes[i][2]);
+ document.querySelectorAll('.sw').forEach((s,j)=>s.classList.toggle('on',j%themes.length===i));}
+for(const host of [document.getElementById('swatches'),document.getElementById('pal')])
+ themes.forEach((t,i)=>{const b=document.createElement('button');b.className='sw';b.title=t[0];
+  b.style.background=t[1];b.onclick=()=>set(i);host.appendChild(b);});
+set(0);
+</script>
+</body>
+</html>
