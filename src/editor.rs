@@ -385,6 +385,10 @@ struct State {
     toolbar_timer: Option<glib::SourceId>,
     /// A mouse button is down in the text: a selection is being dragged.
     pointer_down: bool,
+    /// Where the toolbar sits for the current selection (start, end, x):
+    /// formatting the same selection (say H1, which makes the text bigger)
+    /// must not slide it away from under the mouse.
+    toolbar_x: Option<(i32, i32, i32)>,
     writing: bool,
     save_again: bool,
 }
@@ -398,6 +402,7 @@ struct Callbacks {
 
 struct Inner {
     root: gtk::Overlay,
+    toolbar_buttons: RefCell<Vec<(&'static str, gtk::Button)>>,
     view: View,
     buffer: gtk::TextBuffer,
     tags: Tags,
@@ -473,6 +478,7 @@ impl Editor {
 
         let editor = Editor(Rc::new(Inner {
             root,
+            toolbar_buttons: RefCell::new(Vec::new()),
             view,
             buffer,
             tags,
@@ -563,9 +569,17 @@ impl Editor {
                 }
             });
         }
+        // move the toolbar in place once the text is laid out again; never
+        // hide it in between, or a quick second click lands in the text
         if self.0.toolbar.is_visible() {
-            self.0.toolbar.popdown();
-            self.schedule_toolbar();
+            let weak = self.downgrade();
+            glib::timeout_add_local_once(Duration::from_millis(30), move || {
+                if let Some(editor) = upgrade(&weak)
+                    && editor.0.toolbar.is_visible()
+                {
+                    editor.show_toolbar();
+                }
+            });
         }
     }
 
@@ -1643,8 +1657,46 @@ impl Editor {
                 }
             });
             row.append(&button);
+            self.0.toolbar_buttons.borrow_mut().push((label, button));
         }
         self.0.toolbar.set_child(Some(&row));
+    }
+
+    /// Marks the toolbar buttons whose formatting the whole selection has,
+    /// so it is clear what a click will switch off.
+    fn update_toolbar_state(&self) {
+        let Some((start, end)) = self.0.buffer.selection_bounds() else {
+            return;
+        };
+        let tags = &self.0.tags;
+        let all_chars = |tag: &gtk::TextTag| {
+            let mut iter = start;
+            while iter < end {
+                if !iter.ends_line() && !iter.has_tag(tag) {
+                    return false;
+                }
+                iter.forward_char();
+            }
+            true
+        };
+        let (first, last) = self.selected_lines();
+        let all_lines =
+            |check: &dyn Fn(LineKind) -> bool| (first..=last).all(|n| check(self.0.view.kind(n)));
+        for (label, button) in self.0.toolbar_buttons.borrow().iter() {
+            let on = match *label {
+                "B" => all_chars(&tags.bold),
+                "I" => all_chars(&tags.italic),
+                "U" => all_chars(&tags.underline),
+                "•" => all_lines(&|k| matches!(k, LineKind::Bullet { .. })),
+                "H1" => all_lines(&|k| k == LineKind::H1),
+                _ => all_lines(&|k| k == LineKind::H2),
+            };
+            if on {
+                button.add_css_class("on");
+            } else {
+                button.remove_css_class("on");
+            }
+        }
     }
 
     /// The toolbar follows the selection, but never while the mouse is
@@ -1738,6 +1790,12 @@ impl Editor {
         // like the design: just right of the selection start, above it;
         // below the line when there is no room above
         let x = (x + 7).min(view.width() - width).max(0);
+        let selection = (start.offset(), end.offset());
+        let x = match self.0.state.borrow().toolbar_x {
+            Some((a, b, kept)) if (a, b) == selection => kept,
+            _ => x,
+        };
+        self.0.state.borrow_mut().toolbar_x = Some((selection.0, selection.1, x));
         let room_above = y >= toolbar_height + 2;
         let (position, rect) = if room_above {
             (
@@ -1750,6 +1808,7 @@ impl Editor {
                 gdk::Rectangle::new(x, y + height as i32, width.max(1), 1),
             )
         };
+        self.update_toolbar_state();
         self.0.toolbar.set_position(position);
         self.0.toolbar.set_pointing_to(Some(&rect));
         if self.0.toolbar.is_visible() {

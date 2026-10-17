@@ -212,6 +212,8 @@ popover.toolbar > contents {
 popover.toolbar button { padding: 0 6px; border-radius: 6px; }
 popover.toolbar button label { line-height: 20.15px; }
 popover.toolbar button:hover { background-color: alpha(@paper, 0.15); }
+popover.toolbar button.on { background-color: alpha(@paper, 0.25); }
+popover.toolbar button.on:hover { background-color: alpha(@paper, 0.32); }
 popover.toolbar .b { font-weight: 500; }
 popover.toolbar .i { font-style: italic; }
 popover.toolbar .u label { text-decoration-line: underline; }
