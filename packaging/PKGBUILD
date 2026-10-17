@@ -1,0 +1,44 @@
+# Maintainer: loveranmar <love.ranmar@outlook.com>
+pkgname=kludd
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="A dead-fast, cute Markdown notepad for Hyprland"
+arch=('x86_64' 'aarch64')
+url="https://github.com/loveranmar/kludd"
+license=('MIT' 'OFL-1.1')
+depends=('gtk4' 'ttf-jetbrains-mono' 'glib2' 'pango' 'cairo' 'gcc-libs' 'glibc')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP') # run `updpkgsums` once the v$pkgver tag exists
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/kludd "$pkgdir/usr/bin/kludd"
+  install -Dm644 assets/kludd.desktop "$pkgdir/usr/share/applications/kludd.desktop"
+  install -Dm644 assets/io.github.loveranmar.Kludd.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.loveranmar.Kludd.svg"
+  install -Dm644 "assets/fonts/Fredoka[wdth,wght].ttf" \
+    "$pkgdir/usr/share/fonts/kludd/Fredoka[wdth,wght].ttf"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 assets/fonts/OFL.txt "$pkgdir/usr/share/licenses/$pkgname/OFL-Fredoka.txt"
+  install -Dm644 assets/icons/LICENSE-tabler "$pkgdir/usr/share/licenses/$pkgname/LICENSE-tabler"
+}

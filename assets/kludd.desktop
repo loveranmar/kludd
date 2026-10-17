@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Kludd
+GenericName=Notepad
+Comment=Dead-fast, cute Markdown notepad
+Exec=kludd %F
+Icon=io.github.loveranmar.Kludd
+Terminal=false
+Categories=Utility;TextEditor;GTK;
+Keywords=notes;markdown;notepad;
+MimeType=text/markdown;
+StartupWMClass=io.github.loveranmar.Kludd
