@@ -73,7 +73,7 @@ windowrule {
 }
 ```
 
-If you used `install.sh`, `~/.local/bin` may not be on Hyprland's `PATH`; write `~/.local/bin/kludd` as the full path (`/home/you/.local/bin/kludd`) in the `exec-once` line. When `special:kludd` opens, Kludd focuses itself through Hyprland's event socket, so you can start typing right away.
+If you used `install.sh`, `~/.local/bin` may not be on Hyprland's `PATH`; write `~/.local/bin/kludd` as the full path (`/home/you/.local/bin/kludd`) in the `exec-once` line. When `special:kludd` opens, Kludd focuses itself through Hyprland's event socket, so you can start typing right away. Closing the window (say, your `killactive` bind) hides Kludd instead of quitting it, so <kbd>Home</kbd> stays instant; `kludd --quit` quits for real.
 
 To open `.md` files with Kludd by default, run `xdg-mime default kludd.desktop text/markdown`.
 

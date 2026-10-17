@@ -182,7 +182,7 @@ impl Kludd {
         });
         kludd.connect(app);
         kludd.watch_dir();
-        hypr::focus_when_shown();
+        hypr::follow_focus();
         kludd.rescan();
         kludd.start_clock();
         kludd.update_status();
@@ -632,11 +632,20 @@ mod hypr {
         request(&format!("dispatch togglespecialworkspace {WORKSPACE}"));
     }
 
-    /// Hyprland only refocuses the window it last focused in a special
-    /// workspace, and a window started `silent` was never focused. So when
-    /// `special:kludd` opens (the Home bind), focus Kludd ourselves, from a
-    /// thread that follows Hyprland's event socket.
-    pub fn focus_when_shown() {
+    /// Is Kludd the focused window?
+    fn kludd_focused() -> bool {
+        request("j/activewindow")
+            .is_some_and(|r| r.contains("\"class\": \"io.github.loveranmar.Kludd\""))
+    }
+
+    /// Keeps keyboard focus in step with `special:kludd`, from a thread that
+    /// follows Hyprland's event socket:
+    /// - opening it focuses Kludd: Hyprland only refocuses the window it last
+    ///   focused there, and a window started `silent` never was;
+    /// - closing it from inside Kludd (Esc, or Alt+Q / killactive, which
+    ///   Kludd turns into hiding) can leave focus on the now hidden window,
+    ///   so it goes back to the previous one.
+    pub fn follow_focus() {
         let Some(path) = socket_path(".socket2.sock") else {
             return;
         };
@@ -648,6 +657,9 @@ mod hypr {
             for line in BufReader::new(stream).lines().map_while(Result::ok) {
                 if line.starts_with(&opened) {
                     request(&format!("dispatch focuswindow class:{CLASS}"));
+                } else if line.starts_with("activespecial>>") && !special_shown() && kludd_focused()
+                {
+                    request("dispatch focuscurrentorlast");
                 }
             }
         });
