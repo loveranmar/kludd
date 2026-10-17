@@ -125,7 +125,8 @@ impl View {
             return;
         };
         let mut color = self.color();
-        color.set_alpha(color.alpha() * 0.15);
+        // 32 % ink: the design's 15 % was too faint to see on the pastel themes
+        color.set_alpha(color.alpha() * 0.32);
         let radius = 4.0 * self.zoom();
         let visible = self.visible_rect();
         let (top, _) = self.line_at_y(visible.y());
@@ -365,6 +366,8 @@ impl Editor {
         view.set_wrap_mode(gtk::WrapMode::WordChar);
         view.set_accepts_tab(true);
         view.set_vexpand(true);
+        view.set_input_hints(gtk::InputHints::NO_EMOJI);
+        theme::no_builtin_popups(&view);
 
         let scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)

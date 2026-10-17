@@ -18,13 +18,25 @@ use crate::theme::{self, Styles};
 
 pub const APP_ID: &str = "io.github.loveranmar.Kludd";
 
+/// The application id, which Wayland also uses as the window class.
+/// `KLUDD_APP_ID` overrides it, to test a second copy next to your own.
+pub fn app_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        std::env::var("KLUDD_APP_ID")
+            .ok()
+            .filter(|id| gio::Application::id_is_valid(id))
+            .unwrap_or_else(|| APP_ID.to_string())
+    })
+}
+
 thread_local! {
     static START_HIDDEN: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn run() -> glib::ExitCode {
     let app = gtk::Application::builder()
-        .application_id(APP_ID)
+        .application_id(app_id())
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
     app.add_main_option(
@@ -303,6 +315,8 @@ impl Kludd {
         const KEY_0: u32 = 19;
         if mods == M::CONTROL_MASK {
             match key.to_lower() {
+                // GTK's emoji picker (Ctrl+. / Ctrl+;) grabs input; swallow it
+                gdk::Key::period | gdk::Key::semicolon => {}
                 gdk::Key::n => self.new_note(),
                 gdk::Key::f => {
                     self.go_home();
@@ -592,9 +606,23 @@ mod hypr {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
+    use std::sync::OnceLock;
+    use std::time::Duration;
 
-    const WORKSPACE: &str = "kludd";
-    const CLASS: &str = r"^(io\.github\.loveranmar\.Kludd)$";
+    /// Name of the special workspace (`KLUDD_WORKSPACE` overrides it).
+    fn workspace() -> &'static str {
+        static NAME: OnceLock<String> = OnceLock::new();
+        NAME.get_or_init(|| {
+            std::env::var("KLUDD_WORKSPACE")
+                .ok()
+                .filter(|w| {
+                    !w.is_empty()
+                        && w.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                })
+                .unwrap_or_else(|| "kludd".into())
+        })
+    }
 
     fn socket_path(name: &str) -> Option<PathBuf> {
         let signature = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
@@ -617,6 +645,13 @@ mod hypr {
 
     fn request(command: &str) -> Option<String> {
         let mut stream = UnixStream::connect(socket()?).ok()?;
+        // some calls run on the UI thread: never wait on Hyprland for long
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .ok()?;
+        stream
+            .set_write_timeout(Some(Duration::from_millis(500)))
+            .ok()?;
         stream.write_all(command.as_bytes()).ok()?;
         let mut reply = String::new();
         stream.read_to_string(&mut reply).ok()?;
@@ -625,17 +660,21 @@ mod hypr {
 
     /// Is `special:kludd` open on any monitor?
     pub fn special_shown() -> bool {
-        request("j/monitors").is_some_and(|r| r.contains(&format!("\"special:{WORKSPACE}\"")))
+        request("j/monitors").is_some_and(|r| r.contains(&format!("\"special:{}\"", workspace())))
     }
 
     pub fn toggle() {
-        request(&format!("dispatch togglespecialworkspace {WORKSPACE}"));
+        request(&format!("dispatch togglespecialworkspace {}", workspace()));
     }
 
-    /// Is Kludd the focused window?
-    fn kludd_focused() -> bool {
-        request("j/activewindow")
-            .is_some_and(|r| r.contains("\"class\": \"io.github.loveranmar.Kludd\""))
+    /// Is keyboard focus on Kludd while its special workspace is hidden?
+    fn focus_stuck_on_hidden_kludd() -> bool {
+        let Some(active) = request("j/activewindow") else {
+            return false;
+        };
+        active.contains(&format!("\"class\": \"{}\"", super::app_id()))
+            && active.contains(&format!("\"name\": \"special:{}\"", workspace()))
+            && !special_shown()
     }
 
     /// Keeps keyboard focus in step with `special:kludd`, from a thread that
@@ -649,16 +688,16 @@ mod hypr {
         let Some(path) = socket_path(".socket2.sock") else {
             return;
         };
-        let opened = format!("activespecial>>special:{WORKSPACE},");
+        let opened = format!("activespecial>>special:{},", workspace());
+        let class = format!("^({})$", super::app_id().replace('.', "\\."));
         std::thread::spawn(move || {
             let Ok(stream) = UnixStream::connect(path) else {
                 return;
             };
             for line in BufReader::new(stream).lines().map_while(Result::ok) {
                 if line.starts_with(&opened) {
-                    request(&format!("dispatch focuswindow class:{CLASS}"));
-                } else if line.starts_with("activespecial>>") && !special_shown() && kludd_focused()
-                {
+                    request(&format!("dispatch focuswindow class:{class}"));
+                } else if line.starts_with("activespecial>>") && focus_stuck_on_hidden_kludd() {
                     request("dispatch focuscurrentorlast");
                 }
             }

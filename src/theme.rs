@@ -115,7 +115,7 @@ window.kludd {
   caret-color: @ink;
 }
 .search text > placeholder { color: @ink; opacity: 1; }
-.search text selection { background-color: alpha(@ink, 0.15); color: @ink; }
+.search text selection { background-color: alpha(@ink, 0.32); color: @ink; }
 .card {
   background-color: alpha(@ink, 0.07);
   border-radius: 14px;
@@ -228,6 +228,23 @@ impl Styles {
             15.0 * zoom
         ));
     }
+}
+
+/// Turns off GTK's own right-click menu and emoji picker on a text widget.
+/// Both are popovers that grab all input, and with the reset stylesheet
+/// they draw without a background, so they read as a frozen window.
+pub fn no_builtin_popups(widget: &impl IsA<gtk::Widget>) {
+    let widget = widget.as_ref();
+    let block = gtk::GestureClick::builder()
+        .button(gdk::BUTTON_SECONDARY)
+        .propagation_phase(gtk::PropagationPhase::Capture)
+        .build();
+    block.connect_pressed(|gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    widget.add_controller(block);
+    widget.action_set_enabled("menu.popup", false);
+    widget.action_set_enabled("misc.insert-emoji", false);
 }
 
 // ---------------------------------------------------------------------------

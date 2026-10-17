@@ -20,4 +20,12 @@ before you start:
   The editor test drives real GTK widgets; it runs when a display is
   available and is skipped otherwise (as in CI).
 
+To try a build next to the Kludd you use every day, give it its own app id
+and special workspace, so the two don't talk to each other:
+
+```sh
+KLUDD_APP_ID=io.github.loveranmar.KluddTest KLUDD_WORKSPACE=kluddtest \
+  cargo run
+```
+
 Keep dependencies minimal: new crates need a good reason.

@@ -62,6 +62,8 @@ impl Home {
             .placeholder_text("Search…")
             .hexpand(true)
             .build();
+        search.set_input_hints(gtk::InputHints::NO_EMOJI);
+        theme::no_builtin_popups(&search);
         let search_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         search_box.add_css_class("search");
         let search_icon = Icon::new(theme::ICON_SEARCH, 14);
