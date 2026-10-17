@@ -211,7 +211,10 @@ impl Kludd {
         self.home.connect_delete(move |path| {
             if let Some(k) = weak.upgrade() {
                 if let Err(e) = storage::trash(&path) {
-                    k.show_error(format!("could not trash {}: {e}", config::tilde_path(&path)));
+                    k.show_error(format!(
+                        "could not trash {}: {e}",
+                        config::tilde_path(&path)
+                    ));
                 }
                 k.rescan();
             }
@@ -254,7 +257,9 @@ impl Kludd {
         // closing only hides: the hotkey must find Kludd running
         let weak = Rc::downgrade(self);
         self.window.connect_close_request(move |_| {
-            let Some(k) = weak.upgrade() else { return glib::Propagation::Proceed };
+            let Some(k) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             k.editor.save_sync();
             if hypr::available() {
                 k.hide();
@@ -398,7 +403,11 @@ impl Kludd {
             self.show_error(format!("could not open {}: {e}", config::tilde_path(&path)));
             return;
         }
-        *self.file_monitor.borrow_mut() = if managed { None } else { self.watch_file(&path) };
+        *self.file_monitor.borrow_mut() = if managed {
+            None
+        } else {
+            self.watch_file(&path)
+        };
         self.show_editor();
     }
 
@@ -467,7 +476,8 @@ impl Kludd {
         match self.page.get() {
             Page::Home => {
                 let n = self.home.visible_count();
-                self.status_right.set_text(&format!("{n} {}", if n == 1 { "note" } else { "notes" }));
+                self.status_right
+                    .set_text(&format!("{n} {}", if n == 1 { "note" } else { "notes" }));
             }
             Page::Editor => self.status_right.set_text(&clock()),
         }
@@ -482,7 +492,9 @@ impl Kludd {
     /// Ticks on the minute so the clock never lags.
     fn start_clock(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
-        let now = glib::DateTime::now_local().map(|d| d.second() as u64).unwrap_or(0);
+        let now = glib::DateTime::now_local()
+            .map(|d| d.second() as u64)
+            .unwrap_or(0);
         glib::timeout_add_seconds_local_once((60 - now.min(59)) as u32, move || {
             if let Some(k) = weak.upgrade() {
                 k.update_status();
@@ -517,13 +529,18 @@ impl Kludd {
 
     fn watch_dir(self: &Rc<Self>) {
         let dir = gio::File::for_path(self.config.borrow().notes_dir());
-        let Ok(monitor) = dir.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE) else {
+        let Ok(monitor) =
+            dir.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+        else {
             return;
         };
         let weak = Rc::downgrade(self);
         monitor.connect_changed(move |_, file, other, _| {
             let Some(k) = weak.upgrade() else { return };
-            let touched = [Some(file), other].into_iter().flatten().filter_map(|f| f.path());
+            let touched = [Some(file), other]
+                .into_iter()
+                .flatten()
+                .filter_map(|f| f.path());
             let mut any = false;
             for path in touched.filter(|p| storage::is_note(p)) {
                 k.editor.file_changed(&path);
@@ -546,7 +563,9 @@ impl Kludd {
         monitor.connect_changed(move |_, _, _, event| {
             if matches!(
                 event,
-                gio::FileMonitorEvent::ChangesDoneHint | gio::FileMonitorEvent::Created | gio::FileMonitorEvent::MovedIn
+                gio::FileMonitorEvent::ChangesDoneHint
+                    | gio::FileMonitorEvent::Created
+                    | gio::FileMonitorEvent::MovedIn
             ) && let Some(k) = weak.upgrade()
             {
                 k.editor.file_changed(&path);
@@ -578,7 +597,12 @@ mod hypr {
     fn socket() -> Option<PathBuf> {
         let signature = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
-        Some(PathBuf::from(runtime).join("hypr").join(signature).join(".socket.sock"))
+        Some(
+            PathBuf::from(runtime)
+                .join("hypr")
+                .join(signature)
+                .join(".socket.sock"),
+        )
     }
 
     pub fn available() -> bool {

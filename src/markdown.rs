@@ -54,14 +54,20 @@ pub enum LineKind {
     H1,
     H2,
     /// `indent` leading spaces, then `marker` (`-`, `*` or `+`) and a space.
-    Bullet { indent: u8, marker: u8 },
+    Bullet {
+        indent: u8,
+        marker: u8,
+    },
     /// Unsupported Markdown, kept exactly as written.
     Raw,
 }
 
 impl LineKind {
     pub fn bullet(indent: u8) -> LineKind {
-        LineKind::Bullet { indent, marker: b'-' }
+        LineKind::Bullet {
+            indent,
+            marker: b'-',
+        }
     }
 }
 
@@ -92,7 +98,10 @@ pub struct Span {
 
 impl Span {
     pub fn new(text: impl Into<String>, style: Style) -> Span {
-        Span { text: text.into(), style }
+        Span {
+            text: text.into(),
+            style,
+        }
     }
 }
 
@@ -165,7 +174,9 @@ pub fn parse(src: &str) -> Vec<Line> {
     let mut class = vec![Class::Uncovered; lines.len()];
     let line_of = |offset: usize| -> usize {
         // index of the line whose content+eol contains `offset`
-        lines.partition_point(|(r, _)| r.start <= offset).saturating_sub(1)
+        lines
+            .partition_point(|(r, _)| r.start <= offset)
+            .saturating_sub(1)
     };
 
     let mut depth = 0usize;
@@ -237,7 +248,8 @@ pub fn parse(src: &str) -> Vec<Line> {
             let parsed = if blank && class != Class::Raw {
                 Some(blank_line(content))
             } else if rich {
-                parse_line(content).filter(|(kind, spans)| render(*kind, spans, Mode::PLAIN) == content)
+                parse_line(content)
+                    .filter(|(kind, spans)| render(*kind, spans, Mode::PLAIN) == content)
             } else {
                 None
             };
@@ -277,7 +289,11 @@ pub fn raw_line(content: &str, eol: Eol) -> Line {
     } else {
         vec![Span::new(content, Style::RAW)]
     };
-    Line { kind: LineKind::Raw, spans, eol }
+    Line {
+        kind: LineKind::Raw,
+        spans,
+        eol,
+    }
 }
 
 /// Recognises the line prefix: `# `, `## `, `<indent>- ` or nothing.
@@ -295,7 +311,10 @@ fn line_prefix(content: &str) -> (LineKind, usize) {
         && matches!(rest[0], b'-' | b'*' | b'+')
         && rest[1] == b' '
     {
-        let kind = LineKind::Bullet { indent: indent as u8, marker: rest[0] };
+        let kind = LineKind::Bullet {
+            indent: indent as u8,
+            marker: rest[0],
+        };
         return (kind, indent + 2);
     }
     (LineKind::Text, 0)
@@ -308,7 +327,11 @@ pub fn parse_line(content: &str) -> Option<(LineKind, Vec<Span>)> {
     let body = &content[prefix_len..];
     let lead_len = body.len() - body.trim_start_matches([' ', '\t']).len();
     let core_end = body.trim_end_matches([' ', '\t']).len().max(lead_len);
-    let (lead, core, trail) = (&body[..lead_len], &body[lead_len..core_end], &body[core_end..]);
+    let (lead, core, trail) = (
+        &body[..lead_len],
+        &body[lead_len..core_end],
+        &body[core_end..],
+    );
 
     let mut spans = Vec::new();
     if !lead.is_empty() {
@@ -335,8 +358,24 @@ fn parse_inline(src: &str, offset: usize, kind: LineKind) -> Option<Vec<Span>> {
 
     // The block structure must be exactly what the prefix promises.
     let opening: &[fn(&Event) -> bool] = match kind {
-        LineKind::H1 => &[|e| matches!(e, Event::Start(Tag::Heading { level: HeadingLevel::H1, .. }))],
-        LineKind::H2 => &[|e| matches!(e, Event::Start(Tag::Heading { level: HeadingLevel::H2, .. }))],
+        LineKind::H1 => &[|e| {
+            matches!(
+                e,
+                Event::Start(Tag::Heading {
+                    level: HeadingLevel::H1,
+                    ..
+                })
+            )
+        }],
+        LineKind::H2 => &[|e| {
+            matches!(
+                e,
+                Event::Start(Tag::Heading {
+                    level: HeadingLevel::H2,
+                    ..
+                })
+            )
+        }],
         LineKind::Bullet { .. } => &[
             |e| matches!(e, Event::Start(Tag::List(None))),
             |e| matches!(e, Event::Start(Tag::Item)),
@@ -551,7 +590,9 @@ fn normalized(spans: &[Span]) -> Vec<(char, u8)> {
         .collect()
 }
 
-const INLINE_SPECIAL: &[char] = &['\\', '*', '_', '`', '[', ']', '<', '>', '~', '&', '!', '#', '|'];
+const INLINE_SPECIAL: &[char] = &[
+    '\\', '*', '_', '`', '[', ']', '<', '>', '~', '&', '!', '#', '|',
+];
 
 fn needs_check(spans: &[Span]) -> bool {
     let mut first = true;
@@ -602,10 +643,26 @@ struct Mode {
 }
 
 impl Mode {
-    const PLAIN: Mode = Mode { escape: false, swap_italic: false, markup: true };
-    const ESCAPED: Mode = Mode { escape: true, swap_italic: false, markup: true };
-    const ESCAPED_ALT: Mode = Mode { escape: true, swap_italic: true, markup: true };
-    const TEXT_ONLY: Mode = Mode { escape: true, swap_italic: false, markup: false };
+    const PLAIN: Mode = Mode {
+        escape: false,
+        swap_italic: false,
+        markup: true,
+    };
+    const ESCAPED: Mode = Mode {
+        escape: true,
+        swap_italic: false,
+        markup: true,
+    };
+    const ESCAPED_ALT: Mode = Mode {
+        escape: true,
+        swap_italic: true,
+        markup: true,
+    };
+    const TEXT_ONLY: Mode = Mode {
+        escape: true,
+        swap_italic: false,
+        markup: false,
+    };
 }
 
 /// Renders spans as Markdown source.
@@ -658,9 +715,14 @@ fn render(kind: LineKind, spans: &[Span], mode: Mode) -> String {
 
     // `1. ` / `1) ` at the start would begin a numbered list: escape the dot
     let indent = chars.iter().take_while(|(c, _)| c.is_whitespace()).count();
-    let digits = chars[indent..].iter().take_while(|(c, s)| c.is_ascii_digit() && *s == Style::NONE).count();
-    let list_dot = (mode.escape && digits > 0 && matches!(chars.get(indent + digits), Some(('.' | ')', Style::NONE))))
-        .then_some(indent + digits);
+    let digits = chars[indent..]
+        .iter()
+        .take_while(|(c, s)| c.is_ascii_digit() && *s == Style::NONE)
+        .count();
+    let list_dot = (mode.escape
+        && digits > 0
+        && matches!(chars.get(indent + digits), Some(('.' | ')', Style::NONE))))
+    .then_some(indent + digits);
 
     let mut open: Vec<(Style, &'static str)> = Vec::new();
     let mut at_start = true;
@@ -677,25 +739,23 @@ fn render(kind: LineKind, spans: &[Span], mode: Mode) -> String {
         // never right before whitespace (`** x**` is not bold)
         let mut missing: Vec<(usize, Style)> = [Style::UNDERLINE, Style::BOLD, Style::ITALIC]
             .into_iter()
-            .filter(|flag| !c.is_whitespace() && want.has(*flag) && !open.iter().any(|(f, _)| f == flag))
+            .filter(|flag| {
+                !c.is_whitespace() && want.has(*flag) && !open.iter().any(|(f, _)| f == flag)
+            })
             .map(|flag| (markup[i..].iter().take_while(|m| m.has(flag)).count(), flag))
             .collect();
-        missing.sort_by(|a, b| b.0.cmp(&a.0));
+        missing.sort_by_key(|&(run, _)| std::cmp::Reverse(run));
         for (_, flag) in missing {
             open_flag(&mut out, &mut open, flag, style, mode);
         }
 
-        if style.has(Style::RAW) {
-            out.push(c);
-        } else if style.has(Style::ESCAPED) {
+        let escape = !style.has(Style::RAW)
+            && (style.has(Style::ESCAPED)
+                || (mode.escape && (needs_escape(c, at_start) || list_dot == Some(i))));
+        if escape {
             out.push('\\');
-            out.push(c);
-        } else if mode.escape && (needs_escape(c, at_start) || list_dot == Some(i)) {
-            out.push('\\');
-            out.push(c);
-        } else {
-            out.push(c);
         }
+        out.push(c);
         at_start &= c.is_whitespace();
     }
     while let Some((_, close)) = open.pop() {
@@ -704,11 +764,21 @@ fn render(kind: LineKind, spans: &[Span], mode: Mode) -> String {
     out
 }
 
-fn open_flag(out: &mut String, open: &mut Vec<(Style, &'static str)>, flag: Style, style: Style, mode: Mode) {
+fn open_flag(
+    out: &mut String,
+    open: &mut Vec<(Style, &'static str)>,
+    flag: Style,
+    style: Style,
+    mode: Mode,
+) {
     let (start, end) = if flag == Style::UNDERLINE {
         ("<u>", "</u>")
     } else if flag == Style::BOLD {
-        if style.has(Style::BOLD_US) { ("__", "__") } else { ("**", "**") }
+        if style.has(Style::BOLD_US) {
+            ("__", "__")
+        } else {
+            ("**", "**")
+        }
     } else if style.has(Style::ITALIC_US) != mode.swap_italic {
         ("_", "_")
     } else {
@@ -719,8 +789,10 @@ fn open_flag(out: &mut String, open: &mut Vec<(Style, &'static str)>, flag: Styl
 }
 
 fn needs_escape(c: char, line_start: bool) -> bool {
-    matches!(c, '\\' | '*' | '_' | '`' | '[' | ']' | '<' | '~' | '&' | '!')
-        || (line_start && matches!(c, '#' | '>' | '-' | '+' | '=' | '|'))
+    matches!(
+        c,
+        '\\' | '*' | '_' | '`' | '[' | ']' | '<' | '~' | '&' | '!'
+    ) || (line_start && matches!(c, '#' | '>' | '-' | '+' | '=' | '|'))
 }
 
 // ---------------------------------------------------------------------------
@@ -801,7 +873,11 @@ mod tests {
         let src = "# Title\n\n```rust\nfn main() { **not bold** }\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n> quote\n\n1. one\n2. two\n\n### deep\n\n---\n\n<div>\nhtml\n</div>\n\n[ref]: https://example.com\n";
         round_trip(src);
         let lines = parse(src);
-        let raw: Vec<_> = lines.iter().filter(|l| l.kind == LineKind::Raw).map(|l| l.text()).collect();
+        let raw: Vec<_> = lines
+            .iter()
+            .filter(|l| l.kind == LineKind::Raw)
+            .map(|l| l.text())
+            .collect();
         assert!(raw.contains(&"fn main() { **not bold** }".to_string()));
         assert!(raw.contains(&"| 1 | 2 |".to_string()));
         assert!(raw.contains(&"> quote".to_string()));
@@ -816,7 +892,11 @@ mod tests {
         round_trip(src);
         let line = &parse(src)[0];
         assert_eq!(line.kind, LineKind::Text);
-        assert!(line.spans.iter().any(|s| s.text == "[the docs](https://x.y)" && s.style.has(Style::RAW)));
+        assert!(
+            line.spans
+                .iter()
+                .any(|s| s.text == "[the docs](https://x.y)" && s.style.has(Style::RAW))
+        );
     }
 
     #[test]
@@ -835,7 +915,13 @@ mod tests {
         let lines = parse(src);
         assert_eq!(lines[1].kind, LineKind::bullet(2));
         assert_eq!(lines[2].kind, LineKind::bullet(4));
-        assert_eq!(lines[3].kind, LineKind::Bullet { indent: 0, marker: b'*' });
+        assert_eq!(
+            lines[3].kind,
+            LineKind::Bullet {
+                indent: 0,
+                marker: b'*'
+            }
+        );
     }
 
     #[test]
@@ -900,10 +986,7 @@ mod tests {
             Span::new("world", Style::NONE),
         ];
         assert_eq!(serialize_line(LineKind::Text, &spans), "**hello** world");
-        let spans = [
-            Span::new("a", Style::BOLD),
-            Span::new("b", Style::ITALIC),
-        ];
+        let spans = [Span::new("a", Style::BOLD), Span::new("b", Style::ITALIC)];
         let md = serialize_line(LineKind::Text, &spans);
         let (_, back) = parse_line(&md).unwrap();
         assert_eq!(normalized(&back), normalized(&spans), "{md}");
@@ -926,10 +1009,57 @@ mod tests {
     #[test]
     fn fuzz_any_file_round_trips() {
         let pieces = [
-            "a", "word", " ", "  ", "\t", "\n", "\n", "\r\n", "\r", "*", "**", "_", "__", "`", "```",
-            "~", "~~", "#", "# ", "## ", "### ", "- ", "* ", "+ ", "1. ", "2) ", "> ", "    ", "<u>",
-            "</u>", "<b>", "[", "]", "(", ")", "](x)", "![", "\\", "\\*", "&amp;", "&", "|", "---",
-            "===", "<!-- c -->", "<div>", "é", "🙂", "[^1]", "$x$", "- [ ] ",
+            "a",
+            "word",
+            " ",
+            "  ",
+            "\t",
+            "\n",
+            "\n",
+            "\r\n",
+            "\r",
+            "*",
+            "**",
+            "_",
+            "__",
+            "`",
+            "```",
+            "~",
+            "~~",
+            "#",
+            "# ",
+            "## ",
+            "### ",
+            "- ",
+            "* ",
+            "+ ",
+            "1. ",
+            "2) ",
+            "> ",
+            "    ",
+            "<u>",
+            "</u>",
+            "<b>",
+            "[",
+            "]",
+            "(",
+            ")",
+            "](x)",
+            "![",
+            "\\",
+            "\\*",
+            "&amp;",
+            "&",
+            "|",
+            "---",
+            "===",
+            "<!-- c -->",
+            "<div>",
+            "é",
+            "🙂",
+            "[^1]",
+            "$x$",
+            "- [ ] ",
         ];
         let mut rng = Rng(0x9E3779B97F4A7C15);
         for _ in 0..20_000 {
@@ -945,7 +1075,9 @@ mod tests {
         // Whatever the user types and formats must load back with the same
         // look. Lines that cannot be expressed are allowed to load raw, but
         // never to change their text.
-        let words = ["a", "word", " ", "*", "_", "#", "-", "1.", "[x]", "<", "&", "\\", "`", "é", "!"];
+        let words = [
+            "a", "word", " ", "*", "_", "#", "-", "1.", "[x]", "<", "&", "\\", "`", "é", "!",
+        ];
         let styles = [
             Style::NONE,
             Style::BOLD,
@@ -954,7 +1086,13 @@ mod tests {
             Style::BOLD.with(Style::ITALIC),
             Style::BOLD.with(Style::UNDERLINE),
         ];
-        let kinds = [LineKind::Text, LineKind::H1, LineKind::H2, LineKind::bullet(0), LineKind::bullet(2)];
+        let kinds = [
+            LineKind::Text,
+            LineKind::H1,
+            LineKind::H2,
+            LineKind::bullet(0),
+            LineKind::bullet(2),
+        ];
         let mut rng = Rng(0xDEADBEEF12345678);
         let mut rich = 0;
         let mut unformatted = 0;
@@ -976,34 +1114,75 @@ mod tests {
             } else {
                 rich += 1;
                 assert_eq!(line.text(), text, "text changed: {spans:?} -> {md:?}");
-                if md == render(kind, &spans, Mode::TEXT_ONLY) && normalized(&line.spans) != normalized(&spans) {
+                if md == render(kind, &spans, Mode::TEXT_ONLY)
+                    && normalized(&line.spans) != normalized(&spans)
+                {
                     // e.g. `*!*é`: CommonMark has no way to italicise
                     // punctuation glued to a letter; the text survives
                     unformatted += 1;
-                } else if !text.starts_with(char::is_whitespace) && !text.ends_with(char::is_whitespace) {
-                    assert_eq!(normalized(&line.spans), normalized(&spans), "style changed: {spans:?} -> {md:?}");
+                } else if !text.starts_with(char::is_whitespace)
+                    && !text.ends_with(char::is_whitespace)
+                {
+                    assert_eq!(
+                        normalized(&line.spans),
+                        normalized(&spans),
+                        "style changed: {spans:?} -> {md:?}"
+                    );
                 }
             }
         }
         assert!(rich > 15_000, "too many lines fell back to raw: {rich}");
         // this corpus is mostly punctuation; real text is checked below
-        assert!(unformatted < 4_000, "too many lines lost formatting: {unformatted}");
+        assert!(
+            unformatted < 4_000,
+            "too many lines lost formatting: {unformatted}"
+        );
     }
 
     #[test]
     fn fuzz_realistic_formatting_survives() {
         let words = [
-            "hello", "world", "Friday", "dentist", "é", "42", " ", " ", " ", ", ", ". ", "!", "?",
-            "(maybe)", "C#", "5 * 3", "snake_case", "a&b", "x<y", "it's", "\\path",
+            "hello",
+            "world",
+            "Friday",
+            "dentist",
+            "é",
+            "42",
+            " ",
+            " ",
+            " ",
+            ", ",
+            ". ",
+            "!",
+            "?",
+            "(maybe)",
+            "C#",
+            "5 * 3",
+            "snake_case",
+            "a&b",
+            "x<y",
+            "it's",
+            "\\path",
         ];
-        let styles = [Style::NONE, Style::BOLD, Style::ITALIC, Style::UNDERLINE, Style::BOLD.with(Style::ITALIC)];
-        let kinds = [LineKind::Text, LineKind::H1, LineKind::H2, LineKind::bullet(0)];
+        let styles = [
+            Style::NONE,
+            Style::BOLD,
+            Style::ITALIC,
+            Style::UNDERLINE,
+            Style::BOLD.with(Style::ITALIC),
+        ];
+        let kinds = [
+            LineKind::Text,
+            LineKind::H1,
+            LineKind::H2,
+            LineKind::bullet(0),
+        ];
         let mut rng = Rng(0x1234_5678_9ABC_DEF1);
         for _ in 0..20_000 {
             let kind = kinds[(rng.next() % kinds.len() as u64) as usize];
             // formatting is applied to whole words, as a person would
             let spans: Vec<Span> = (0..1 + rng.next() % 8)
-                .map(|i| {
+                .flat_map(|i| {
                     let style = styles[(rng.next() % styles.len() as u64) as usize];
                     let mut word = rng.pick(&words);
                     if i == 0 && word.trim().is_empty() {
@@ -1012,7 +1191,6 @@ mod tests {
                     let gap = if i == 0 { "" } else { " " };
                     [Span::new(gap, Style::NONE), Span::new(word, style)]
                 })
-                .flatten()
                 .collect();
             let spans = merge(spans);
             let md = serialize_line(kind, &spans);
@@ -1021,16 +1199,29 @@ mod tests {
             let text: String = spans.iter().map(|s| s.text.as_str()).collect();
             assert_eq!(line.text(), text, "{md:?}");
             if !text.starts_with(' ') && !text.ends_with(' ') {
-                assert_eq!(normalized(&line.spans), normalized(&spans), "{spans:?} -> {md:?}");
+                assert_eq!(
+                    normalized(&line.spans),
+                    normalized(&spans),
+                    "{spans:?} -> {md:?}"
+                );
             }
         }
     }
 
     #[test]
     fn titles() {
-        assert_eq!(title("# Things to fix\nbody").as_deref(), Some("Things to fix"));
-        assert_eq!(title("intro\n# **Bold** title\n").as_deref(), Some("Bold title"));
-        assert_eq!(title("```\n# not a title\n```\n# Real\n").as_deref(), Some("Real"));
+        assert_eq!(
+            title("# Things to fix\nbody").as_deref(),
+            Some("Things to fix")
+        );
+        assert_eq!(
+            title("intro\n# **Bold** title\n").as_deref(),
+            Some("Bold title")
+        );
+        assert_eq!(
+            title("```\n# not a title\n```\n# Real\n").as_deref(),
+            Some("Real")
+        );
         assert_eq!(title("no heading"), None);
     }
 }

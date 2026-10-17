@@ -17,12 +17,36 @@ pub struct Theme {
 }
 
 pub const THEMES: [Theme; 6] = [
-    Theme { name: "pink", paper: "#FFD6E5", ink: "#4A1F30" },
-    Theme { name: "yellow", paper: "#FFF3B0", ink: "#3A3320" },
-    Theme { name: "mint", paper: "#D4F5E4", ink: "#173A2A" },
-    Theme { name: "lavender", paper: "#E4DCFF", ink: "#2A2350" },
-    Theme { name: "sky", paper: "#D6ECFF", ink: "#14304D" },
-    Theme { name: "dark", paper: "#1E1E24", ink: "#ECEAF2" },
+    Theme {
+        name: "pink",
+        paper: "#FFD6E5",
+        ink: "#4A1F30",
+    },
+    Theme {
+        name: "yellow",
+        paper: "#FFF3B0",
+        ink: "#3A3320",
+    },
+    Theme {
+        name: "mint",
+        paper: "#D4F5E4",
+        ink: "#173A2A",
+    },
+    Theme {
+        name: "lavender",
+        paper: "#E4DCFF",
+        ink: "#2A2350",
+    },
+    Theme {
+        name: "sky",
+        paper: "#D6ECFF",
+        ink: "#14304D",
+    },
+    Theme {
+        name: "dark",
+        paper: "#1E1E24",
+        ink: "#ECEAF2",
+    },
 ];
 
 pub fn by_name(name: &str) -> &'static Theme {
@@ -296,7 +320,10 @@ mod tests {
 
     #[test]
     fn icons_have_paths() {
-        assert_eq!(svg_paths(ICON_PLUS).collect::<Vec<_>>(), ["M12 5l0 14", "M5 12l14 0"]);
+        assert_eq!(
+            svg_paths(ICON_PLUS).collect::<Vec<_>>(),
+            ["M12 5l0 14", "M5 12l14 0"]
+        );
         assert_eq!(svg_paths(ICON_SEARCH).count(), 2);
         assert_eq!(svg_paths(ICON_ARROW_LEFT).count(), 3);
         assert_eq!(svg_paths(ICON_PALETTE).count(), 4);

@@ -4,19 +4,21 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 
-use gtk::prelude::*;
 use gtk::gdk;
+use gtk::prelude::*;
 
 use crate::storage::{self, Note};
 use crate::theme::{self, Icon, THEMES};
 
+type Callback<T> = Option<Box<dyn Fn(T)>>;
+
 #[derive(Default)]
 struct Callbacks {
-    open: Option<Box<dyn Fn(PathBuf)>>,
-    new: Option<Box<dyn Fn()>>,
-    theme: Option<Box<dyn Fn(&str)>>,
-    delete: Option<Box<dyn Fn(PathBuf)>>,
-    count: Option<Box<dyn Fn(usize)>>,
+    open: Callback<PathBuf>,
+    new: Callback<()>,
+    theme: Callback<&'static str>,
+    delete: Callback<PathBuf>,
+    count: Callback<usize>,
 }
 
 struct Inner {
@@ -117,11 +119,12 @@ impl Home {
             .collect();
         let palette = popover(&["palette"], gtk::PositionType::Bottom);
         palette.set_child(Some(&swatch_row));
-        palette.set_parent(&palette_button);
-        let width = 6 * 26 + 5 * 8 + 2 * 8;
-        palette.set_offset(-(width / 2 - 15), 8);
+        palette.set_parent(&root);
 
-        let delete = gtk::Button::builder().label("Delete").focus_on_click(false).build();
+        let delete = gtk::Button::builder()
+            .label("Delete")
+            .focus_on_click(false)
+            .build();
         delete.set_cursor_from_name(Some("pointer"));
         let menu = popover(&["toolbar"], gtk::PositionType::Bottom);
         menu.set_child(Some(&delete));
@@ -141,13 +144,13 @@ impl Home {
         }));
 
         let weak = Rc::downgrade(&home.0);
-        palette_button.connect_clicked(move |_| {
+        palette_button.connect_clicked(move |button| {
             let Some(home) = upgrade(&weak) else { return };
             if home.0.palette.is_visible() {
                 home.0.palette.popdown();
             } else {
                 home.0.menu.popdown();
-                home.0.palette.popup();
+                home.show_palette(button);
             }
         });
 
@@ -178,7 +181,7 @@ impl Home {
             if let Some(home) = upgrade(&weak)
                 && let Some(f) = &home.0.callbacks.borrow().new
             {
-                f();
+                f(());
             }
         });
         for (name, button) in &home.0.swatches {
@@ -207,7 +210,12 @@ impl Home {
         let weak = Rc::downgrade(&home.0);
         home.0.grid.connect_child_activated(move |_, child| {
             let Some(home) = upgrade(&weak) else { return };
-            let path = home.0.notes.borrow().get(child.index() as usize).map(|n| n.path.clone());
+            let path = home
+                .0
+                .notes
+                .borrow()
+                .get(child.index() as usize)
+                .map(|n| n.path.clone());
             if let Some(path) = path
                 && let Some(f) = &home.0.callbacks.borrow().open
             {
@@ -215,12 +223,21 @@ impl Home {
             }
         });
 
-        let right_click = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
+        let right_click = gtk::GestureClick::builder()
+            .button(gdk::BUTTON_SECONDARY)
+            .build();
         let weak = Rc::downgrade(&home.0);
         right_click.connect_pressed(move |_, _, x, y| {
             let Some(home) = upgrade(&weak) else { return };
-            let Some(child) = home.0.grid.child_at_pos(x as i32, y as i32) else { return };
-            let path = home.0.notes.borrow().get(child.index() as usize).map(|n| n.path.clone());
+            let Some(child) = home.0.grid.child_at_pos(x as i32, y as i32) else {
+                return;
+            };
+            let path = home
+                .0
+                .notes
+                .borrow()
+                .get(child.index() as usize)
+                .map(|n| n.path.clone());
             home.0.menu_target.replace(path);
             let at = home
                 .0
@@ -235,7 +252,9 @@ impl Home {
 
         let weak = Rc::downgrade(&home.0);
         home.0.grid.set_filter_func(move |child| {
-            let Some(home) = upgrade(&weak) else { return true };
+            let Some(home) = upgrade(&weak) else {
+                return true;
+            };
             let query = home.0.search.text().to_lowercase();
             home.0
                 .notes
@@ -267,9 +286,9 @@ impl Home {
         self.0.callbacks.borrow_mut().open = Some(Box::new(f));
     }
     pub fn connect_new(&self, f: impl Fn() + 'static) {
-        self.0.callbacks.borrow_mut().new = Some(Box::new(f));
+        self.0.callbacks.borrow_mut().new = Some(Box::new(move |()| f()));
     }
-    pub fn connect_theme(&self, f: impl Fn(&str) + 'static) {
+    pub fn connect_theme(&self, f: impl Fn(&'static str) + 'static) {
         self.0.callbacks.borrow_mut().theme = Some(Box::new(f));
     }
     pub fn connect_delete(&self, f: impl Fn(PathBuf) + 'static) {
@@ -289,7 +308,12 @@ impl Home {
 
     pub fn visible_count(&self) -> usize {
         let query = self.0.search.text().to_lowercase();
-        self.0.notes.borrow().iter().filter(|n| n.matches(query.trim())).count()
+        self.0
+            .notes
+            .borrow()
+            .iter()
+            .filter(|n| n.matches(query.trim()))
+            .count()
     }
 
     pub fn set_notes(&self, notes: Vec<Note>) {
@@ -344,6 +368,21 @@ impl Home {
         text.push(c);
         search.set_text(&text);
         search.set_position(-1);
+    }
+
+    /// Opens the colour picker 8px below the palette button, right edges
+    /// aligned, as in the design.
+    fn show_palette(&self, button: &gtk::Button) {
+        let root = &self.0.root;
+        let Some(bounds) = button.compute_bounds(root) else {
+            return;
+        };
+        let width = 6 * 26 + 5 * 8 + 2 * 8;
+        let right = (bounds.x() + bounds.width()) as i32;
+        let bottom = (bounds.y() + bounds.height()) as i32;
+        let rect = gdk::Rectangle::new(right - width, bottom + 8, width, 1);
+        self.0.palette.set_pointing_to(Some(&rect));
+        self.0.palette.popup();
     }
 
     /// Closes the palette or card menu; returns false if neither was open.
@@ -401,7 +440,11 @@ fn popover(classes: &[&str], position: gtk::PositionType) -> gtk::Popover {
 
 fn card(note: &Note) -> gtk::FlowBoxChild {
     let title = gtk::Label::builder()
-        .label(if note.title.trim().is_empty() { "Untitled" } else { note.title.as_str() })
+        .label(if note.title.trim().is_empty() {
+            "Untitled"
+        } else {
+            note.title.as_str()
+        })
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .single_line_mode(true)

@@ -29,7 +29,10 @@ pub fn is_note(path: &Path) -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         .is_none_or(|n| n.starts_with('.'));
-    !hidden && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("md"))
+    !hidden
+        && path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("md"))
 }
 
 /// Lists the notes in `dir`, newest first. Files whose size and mtime did
@@ -58,7 +61,11 @@ pub fn scan(dir: &Path, previous: &[Note]) -> Vec<Note> {
             Some(note_from(path, &text, modified, meta.len()))
         })
         .collect();
-    notes.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.title.cmp(&b.title)));
+    notes.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.title.cmp(&b.title))
+    });
     notes
 }
 
@@ -67,7 +74,13 @@ fn note_from(path: PathBuf, text: &str, modified: SystemTime, len: u64) -> Note 
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| stem(&path));
     let haystack = format!("{title}\n{text}").to_lowercase();
-    Note { path, title, modified, len, haystack }
+    Note {
+        path,
+        title,
+        modified,
+        len,
+        haystack,
+    }
 }
 
 fn stem(path: &Path) -> String {
@@ -94,14 +107,22 @@ pub fn slugify(title: &str) -> String {
             break;
         }
     }
-    if slug.is_empty() { "untitled".into() } else { slug }
+    if slug.is_empty() {
+        "untitled".into()
+    } else {
+        slug
+    }
 }
 
 /// `dir/slug.md`, or `dir/slug-2.md`, `-3`, ... if taken by another file.
 pub fn unique_path(dir: &Path, slug: &str, current: Option<&Path>) -> PathBuf {
     let mut n = 1;
     loop {
-        let name = if n == 1 { format!("{slug}.md") } else { format!("{slug}-{n}.md") };
+        let name = if n == 1 {
+            format!("{slug}.md")
+        } else {
+            format!("{slug}-{n}.md")
+        };
         let candidate = dir.join(name);
         if current == Some(candidate.as_path()) || !candidate.exists() {
             return candidate;
@@ -110,7 +131,9 @@ pub fn unique_path(dir: &Path, slug: &str, current: Option<&Path>) -> PathBuf {
     }
 }
 
-const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 /// "today 16:12", "yesterday", "12 Oct", "12 Oct 2025".
 pub fn relative_date(modified: SystemTime) -> String {
@@ -118,7 +141,10 @@ pub fn relative_date(modified: SystemTime) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let (Ok(then), Ok(now)) = (glib::DateTime::from_unix_local(secs), glib::DateTime::now_local()) else {
+    let (Ok(then), Ok(now)) = (
+        glib::DateTime::from_unix_local(secs),
+        glib::DateTime::now_local(),
+    ) else {
         return String::new();
     };
     let same_day = |a: &glib::DateTime, b: &glib::DateTime| a.ymd() == b.ymd();
@@ -151,7 +177,10 @@ pub fn write_target(path: &Path) -> PathBuf {
 pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     let target = write_target(path);
     let dir = target.parent().unwrap_or(Path::new("."));
-    let name = target.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
     let tmp = dir.join(format!(".{name}.kludd-tmp"));
     let result = (|| {
         let mut file = std::fs::File::create(&tmp)?;
@@ -194,10 +223,16 @@ mod tests {
         assert_eq!(unique_path(&dir, "a", None), dir.join("a.md"));
         std::fs::write(dir.join("a.md"), "").unwrap();
         assert_eq!(unique_path(&dir, "a", None), dir.join("a-2.md"));
-        assert_eq!(unique_path(&dir, "a", Some(&dir.join("a.md"))), dir.join("a.md"));
+        assert_eq!(
+            unique_path(&dir, "a", Some(&dir.join("a.md"))),
+            dir.join("a.md")
+        );
         std::fs::write(dir.join("a-2.md"), "").unwrap();
         assert_eq!(unique_path(&dir, "a", None), dir.join("a-3.md"));
-        assert_eq!(unique_path(&dir, "a", Some(&dir.join("a-2.md"))), dir.join("a-2.md"));
+        assert_eq!(
+            unique_path(&dir, "a", Some(&dir.join("a-2.md"))),
+            dir.join("a-2.md")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -225,7 +260,12 @@ mod tests {
         let link = dir.join("link.md");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         write_atomic(&link, "new").unwrap();
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -36,6 +36,9 @@ mod imp {
     #[derive(Default)]
     pub struct View {
         pub kinds: RefCell<Vec<LineKind>>,
+        /// Markdown of each line, kept until the line changes, so saving
+        /// a long note only serializes what was edited.
+        pub cache: RefCell<Vec<Option<String>>>,
         pub zoom: Cell<f64>,
     }
 
@@ -46,7 +49,19 @@ mod imp {
         type ParentType = gtk::TextView;
     }
 
-    impl ObjectImpl for View {}
+    impl ObjectImpl for View {
+        fn dispose(&self) {
+            // GtkTextView only knows how to remove its own children; a
+            // popover parented to it would make dispose spin forever
+            let mut child = self.obj().first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                if widget.is::<gtk::Popover>() {
+                    widget.unparent();
+                }
+            }
+        }
+    }
     impl WidgetImpl for View {}
 
     impl TextViewImpl for View {
@@ -72,11 +87,25 @@ impl View {
         let view: View = glib::Object::new();
         view.imp().zoom.set(1.0);
         view.imp().kinds.replace(vec![LineKind::Text]);
+        view.imp().cache.replace(vec![None]);
         view
     }
 
+    fn invalidate(&self, first: usize, last: usize) {
+        let mut cache = self.imp().cache.borrow_mut();
+        let end = (last + 1).min(cache.len());
+        for entry in &mut cache[first.min(end)..end] {
+            *entry = None;
+        }
+    }
+
     fn kind(&self, line: usize) -> LineKind {
-        self.imp().kinds.borrow().get(line).copied().unwrap_or(LineKind::Text)
+        self.imp()
+            .kinds
+            .borrow()
+            .get(line)
+            .copied()
+            .unwrap_or(LineKind::Text)
     }
 
     fn zoom(&self) -> f32 {
@@ -102,11 +131,11 @@ impl View {
         let (top, _) = self.line_at_y(visible.y());
         let mut iter = if start < top { top } else { start };
         loop {
-            let mut line_end = iter.clone();
+            let mut line_end = iter;
             if !self.ends_display_line(&line_end) {
                 self.forward_display_line_end(&mut line_end);
             }
-            let seg_end = if line_end < end { line_end } else { end.clone() };
+            let seg_end = if line_end < end { line_end } else { end };
             let a = self.iter_location(&iter);
             if a.y() > visible.y() + visible.height() {
                 break;
@@ -128,7 +157,7 @@ impl View {
     }
 
     fn ends_display_line(&self, iter: &gtk::TextIter) -> bool {
-        let mut probe = iter.clone();
+        let mut probe = *iter;
         if !self.forward_display_line_end(&mut probe) {
             return true;
         }
@@ -155,7 +184,9 @@ impl View {
                 builder.add_circle(&graphene::Point::new(cx, cy), 2.5 * zoom);
                 snapshot.append_fill(&builder.to_path(), gsk::FillRule::Winding, &color);
             }
-            if !iter.forward_line() {
+            let line = iter.line();
+            iter.forward_line();
+            if iter.line() == line {
                 break;
             }
         }
@@ -189,14 +220,31 @@ impl Tags {
         };
         let plain = |name: &str| add(gtk::TextTag::builder().name(name).build());
         let tags = Tags {
-            body: add(gtk::TextTag::builder().name("body").line_height(LINE_HEIGHT as f32).build()),
-            h1: add(gtk::TextTag::builder().name("h1").scale(20.0 / 15.0).weight(500).build()),
-            h2: add(gtk::TextTag::builder().name("h2").scale(17.0 / 15.0).weight(500).build()),
+            body: add(gtk::TextTag::builder()
+                .name("body")
+                .line_height(LINE_HEIGHT as f32)
+                .build()),
+            h1: add(gtk::TextTag::builder()
+                .name("h1")
+                .scale(20.0 / 15.0)
+                .weight(500)
+                .build()),
+            h2: add(gtk::TextTag::builder()
+                .name("h2")
+                .scale(17.0 / 15.0)
+                .weight(500)
+                .build()),
             list_start: plain("list-start"),
             levels: (0..LEVELS).map(|i| plain(&format!("level-{i}"))).collect(),
             bold: add(gtk::TextTag::builder().name("bold").weight(500).build()),
-            italic: add(gtk::TextTag::builder().name("italic").style(pango::Style::Italic).build()),
-            underline: add(gtk::TextTag::builder().name("underline").underline(pango::Underline::Single).build()),
+            italic: add(gtk::TextTag::builder()
+                .name("italic")
+                .style(pango::Style::Italic)
+                .build()),
+            underline: add(gtk::TextTag::builder()
+                .name("underline")
+                .underline(pango::Underline::Single)
+                .build()),
             raw: plain("raw"),
             escaped: plain("escaped"),
             italic_us: plain("italic-us"),
@@ -230,7 +278,9 @@ impl Tags {
     }
 
     fn line_tags(&self) -> impl Iterator<Item = &gtk::TextTag> {
-        [&self.h1, &self.h2, &self.list_start].into_iter().chain(self.levels.iter())
+        [&self.h1, &self.h2, &self.list_start]
+            .into_iter()
+            .chain(self.levels.iter())
     }
 }
 
@@ -458,7 +508,7 @@ impl Editor {
     /// Start of `line` to the start of the next line (or the buffer end).
     fn line_span(&self, line: usize) -> (gtk::TextIter, gtk::TextIter) {
         let start = self.line_start(line);
-        let mut end = start.clone();
+        let mut end = start;
         if !end.forward_line() {
             end = self.0.buffer.end_iter();
         }
@@ -482,42 +532,92 @@ impl Editor {
         let mut spans = Vec::new();
         let mut a = start;
         while a < end {
-            let mut b = a.clone();
+            let mut b = a;
             b.forward_to_tag_toggle(None::<&gtk::TextTag>);
             if b > end {
-                b = end.clone();
+                b = end;
             }
-            spans.push(Span::new(buffer.text(&a, &b, true).as_str(), self.style_at(&a)));
+            spans.push(Span::new(
+                buffer.text(&a, &b, true).as_str(),
+                self.style_at(&a),
+            ));
             a = b;
         }
-        let mut next = end.clone();
-        let eol = if next.forward_line() {
-            match buffer.text(&end, &next, true).as_str() {
+        Line {
+            kind: self.0.view.kind(line),
+            spans: markdown::merge(spans),
+            eol: self.line_eol(line),
+        }
+    }
+
+    fn models(&self, first: usize, last: usize) -> Vec<Line> {
+        (first..=last.min(self.line_count() - 1))
+            .map(|n| self.line_model(n))
+            .collect()
+    }
+
+    /// The whole note as Markdown.
+    pub fn text(&self) -> String {
+        let final_eol = self
+            .0
+            .state
+            .borrow()
+            .doc
+            .as_ref()
+            .map_or(Eol::Lf, |d| d.final_eol);
+        let count = self.line_count();
+        self.check_line_table();
+        // line endings straight from the text: one copy instead of thousands
+        // of iterator walks
+        let buffer = &self.0.buffer;
+        let plain = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+        let eols: Vec<Eol> = markdown::split_lines(&plain)
+            .into_iter()
+            .map(|(_, eol)| eol)
+            .collect();
+        // a buffer ending in a line break has an empty last line that
+        // split_lines does not list; its ending is `final_eol` anyway
+        let eols_match = eols.len() + 1 >= count;
+        let mut out = String::with_capacity(plain.len() + plain.len() / 8);
+        for n in 0..count {
+            let cached = self.0.view.imp().cache.borrow()[n].is_some();
+            if !cached {
+                let line = self.line_model(n);
+                let md = markdown::serialize_line(line.kind, &line.spans);
+                self.0.view.imp().cache.borrow_mut()[n] = Some(md);
+            }
+            out.push_str(
+                self.0.view.imp().cache.borrow()[n]
+                    .as_deref()
+                    .unwrap_or_default(),
+            );
+            let eol = if n + 1 == count {
+                final_eol
+            } else if eols_match && n < eols.len() {
+                eols[n]
+            } else {
+                self.line_eol(n)
+            };
+            out.push_str(eol.as_str());
+        }
+        out
+    }
+
+    fn line_eol(&self, line: usize) -> Eol {
+        let end = self.line_content_end(line);
+        let mut next = end;
+        // forward_line() reports false when it lands on the buffer end, even
+        // if that is the start of an empty last line
+        next.forward_line();
+        if next.line() as usize > line {
+            match self.0.buffer.text(&end, &next, true).as_str() {
                 "\r\n" => Eol::CrLf,
                 "\r" => Eol::Cr,
                 _ => Eol::Lf,
             }
         } else {
             Eol::None
-        };
-        Line { kind: self.0.view.kind(line), spans: markdown::merge(spans), eol }
-    }
-
-    fn models(&self, first: usize, last: usize) -> Vec<Line> {
-        (first..=last.min(self.line_count() - 1)).map(|n| self.line_model(n)).collect()
-    }
-
-    /// The whole note as Markdown.
-    pub fn text(&self) -> String {
-        let final_eol = self.0.state.borrow().doc.as_ref().map_or(Eol::Lf, |d| d.final_eol);
-        let count = self.line_count();
-        let mut out = String::new();
-        for n in 0..count {
-            let line = self.line_model(n);
-            out.push_str(&markdown::serialize_line(line.kind, &line.spans));
-            out.push_str(if n + 1 == count { final_eol.as_str() } else { line.eol.as_str() });
         }
-        out
     }
 
     /// Text of the first `# ` line.
@@ -552,15 +652,23 @@ impl Editor {
             buffer.remove_tag(tag, &start, &end);
         }
         buffer.apply_tag(&tags.body, &start, &end);
+        self.apply_kind_tags(line, &start, &end);
+    }
+
+    /// Heading / bullet paragraph tags for one line (nothing removed first).
+    fn apply_kind_tags(&self, line: usize, start: &gtk::TextIter, end: &gtk::TextIter) {
+        let buffer = &self.0.buffer;
+        let tags = &self.0.tags;
         match self.0.view.kind(line) {
-            LineKind::H1 => buffer.apply_tag(&tags.h1, &start, &end),
-            LineKind::H2 => buffer.apply_tag(&tags.h2, &start, &end),
+            LineKind::H1 => buffer.apply_tag(&tags.h1, start, end),
+            LineKind::H2 => buffer.apply_tag(&tags.h2, start, end),
             LineKind::Bullet { indent, .. } => {
                 let level = (indent as usize / 2).min(LEVELS - 1);
-                buffer.apply_tag(&tags.levels[level], &start, &end);
-                let after_bullet = line > 0 && matches!(self.0.view.kind(line - 1), LineKind::Bullet { .. });
+                buffer.apply_tag(&tags.levels[level], start, end);
+                let after_bullet =
+                    line > 0 && matches!(self.0.view.kind(line - 1), LineKind::Bullet { .. });
                 if !after_bullet {
-                    buffer.apply_tag(&tags.list_start, &start, &end);
+                    buffer.apply_tag(&tags.list_start, start, end);
                 }
             }
             LineKind::Text | LineKind::Raw => {}
@@ -578,6 +686,7 @@ impl Editor {
         if let Some(k) = self.0.view.imp().kinds.borrow_mut().get_mut(line) {
             *k = kind;
         }
+        self.0.view.invalidate(line, line);
     }
 
     // -- buffer signals --------------------------------------------------------
@@ -613,6 +722,21 @@ impl Editor {
             None
         });
 
+        // any formatting change makes the line's cached Markdown stale
+        for signal in ["apply-tag", "remove-tag"] {
+            let weak = self.downgrade();
+            buffer.connect_local(signal, true, move |args| {
+                let editor = upgrade(&weak)?;
+                let start = args[2].get::<gtk::TextIter>().ok()?;
+                let end = args[3].get::<gtk::TextIter>().ok()?;
+                editor
+                    .0
+                    .view
+                    .invalidate(start.line() as usize, end.line() as usize);
+                None
+            });
+        }
+
         let weak = self.downgrade();
         buffer.connect_mark_set(move |_, _, mark| {
             let Some(editor) = upgrade(&weak) else { return };
@@ -636,6 +760,7 @@ impl Editor {
     fn before_insert(&self, iter: &gtk::TextIter, text: &str) {
         let line = iter.line() as usize;
         let breaks = line_breaks(text);
+        self.0.view.invalidate(line, line);
         let programmatic = self.0.state.borrow().programmatic;
         if !programmatic {
             let before = vec![self.line_model(line)];
@@ -650,9 +775,14 @@ impl Editor {
             LineKind::H1 | LineKind::H2 => LineKind::Text,
             other => other,
         };
+        {
+            let mut cache = self.0.view.imp().cache.borrow_mut();
+            let at = (line + 1).min(cache.len());
+            cache.splice(at..at, std::iter::repeat_n(None, breaks));
+        }
         let mut kinds = self.0.view.imp().kinds.borrow_mut();
         let at = (line + 1).min(kinds.len());
-        if !programmatic && iter.line_offset() == 0 && !iter.ends_line() {
+        if iter.line_offset() == 0 && !iter.ends_line() {
             // Enter at the start of a line pushes it down whole: the new
             // lines above become plain, the line keeps its kind.
             kinds[line] = next;
@@ -671,7 +801,9 @@ impl Editor {
             }
             state.pending.take()
         };
-        let Some((line, before, cursor_before)) = pending else { return };
+        let Some((line, before, cursor_before)) = pending else {
+            return;
+        };
         let chars = text.chars().count() as i32;
         let start = self.0.buffer.iter_at_offset(end.offset() - chars);
 
@@ -684,8 +816,8 @@ impl Editor {
             for n in line..=line + breaks {
                 let raw = self.0.view.kind(n) == LineKind::Raw;
                 let (ls, le) = self.line_span(n);
-                let a = if ls < start { start.clone() } else { ls };
-                let b = if le > *end { end.clone() } else { le };
+                let a = if ls < start { start } else { ls };
+                let b = if le > *end { *end } else { le };
                 self.apply_style(&a, &b, if raw { Style::RAW } else { style });
             }
         }
@@ -717,10 +849,14 @@ impl Editor {
         if iter.line_offset() == 0 {
             return Style::NONE;
         }
-        let mut prev = iter.clone();
+        let mut prev = *iter;
         prev.backward_char();
         let before = self.style_at(&prev);
-        let after = if iter.ends_line() { Style::NONE } else { self.style_at(iter) };
+        let after = if iter.ends_line() {
+            Style::NONE
+        } else {
+            self.style_at(iter)
+        };
         let mut style = before.and(Style(
             Style::MARKUP.0 | Style::ITALIC_US.0 | Style::BOLD_US.0,
         ));
@@ -733,6 +869,7 @@ impl Editor {
 
     fn before_delete(&self, start: &gtk::TextIter, end: &gtk::TextIter) {
         let (l1, l2) = (start.line() as usize, end.line() as usize);
+        self.0.view.invalidate(l1, l2);
         let programmatic = self.0.state.borrow().programmatic;
         if !programmatic {
             let before = self.models(l1, l2);
@@ -741,14 +878,19 @@ impl Editor {
         }
         if l2 > l1 {
             // a line emptied from its start takes the kind of what moves in
-            let merged = if start.line_offset() == 0 && !programmatic {
+            let merged = if start.line_offset() == 0 {
                 self.0.view.kind(l2)
             } else {
                 self.0.view.kind(l1)
             };
+            {
+                let mut cache = self.0.view.imp().cache.borrow_mut();
+                let to = (l2 + 1).min(cache.len());
+                cache.drain((l1 + 1).min(to)..to);
+            }
             let mut kinds = self.0.view.imp().kinds.borrow_mut();
             let to = (l2 + 1).min(kinds.len());
-            kinds.drain(l1 + 1..to);
+            kinds.drain((l1 + 1).min(to)..to);
             if let Some(k) = kinds.get_mut(l1) {
                 *k = merged;
             }
@@ -764,12 +906,19 @@ impl Editor {
             }
             state.pending.take()
         };
-        let Some((line, before, cursor_before)) = pending else { return };
+        let Some((line, before, cursor_before)) = pending else {
+            return;
+        };
         self.refresh_lines(line, line);
         let typing = before.len() == 1 && {
             let old: usize = before[0].spans.iter().map(|s| s.text.chars().count()).sum();
             let new = self.line_model(line);
-            old == new.spans.iter().map(|s| s.text.chars().count()).sum::<usize>() + 1
+            old == new
+                .spans
+                .iter()
+                .map(|s| s.text.chars().count())
+                .sum::<usize>()
+                + 1
         };
         let after = self.models(line, line);
         self.push_step(Step {
@@ -788,6 +937,10 @@ impl Editor {
     /// change ever slip past the handlers, pad or trim instead of crashing.
     fn check_line_table(&self) {
         let count = self.line_count();
+        let mut cache = self.0.view.imp().cache.borrow_mut();
+        if cache.len() != count {
+            cache.resize(count, None);
+        }
         let mut kinds = self.0.view.imp().kinds.borrow_mut();
         if kinds.len() != count {
             kinds.resize(count, LineKind::Text);
@@ -803,7 +956,11 @@ impl Editor {
         let total = self.line_count();
         let at_end = first + count >= total;
         let mut start = self.line_start(first);
-        let mut end = if at_end { buffer.end_iter() } else { self.line_start(first + count) };
+        let mut end = if at_end {
+            buffer.end_iter()
+        } else {
+            self.line_start(first + count)
+        };
         let start_offset = start.offset();
         buffer.delete(&mut start, &mut end);
 
@@ -812,7 +969,11 @@ impl Editor {
             text.push_str(&line.text());
             let last = i + 1 == lines.len();
             if !(at_end && last) {
-                text.push_str(if line.eol == Eol::None { "\n" } else { line.eol.as_str() });
+                text.push_str(if line.eol == Eol::None {
+                    "\n"
+                } else {
+                    line.eol.as_str()
+                });
             }
         }
         // replacing the tail: the line before keeps its line break, so an
@@ -829,21 +990,38 @@ impl Editor {
         let end = buffer.iter_at_offset(start_offset + text.chars().count() as i32);
         let start = buffer.iter_at_offset(start_offset);
         buffer.remove_all_tags(&start, &end);
+        buffer.apply_tag(&self.0.tags.body, &start, &end);
         let mut offset = start_offset;
         for (i, line) in lines.iter().enumerate() {
+            let line_start = offset;
             self.set_kind(first + i, line.kind);
             for span in &line.spans {
                 let len = span.text.chars().count() as i32;
                 if span.style != Style::NONE {
                     let a = buffer.iter_at_offset(offset);
                     let b = buffer.iter_at_offset(offset + len);
-                    self.apply_style(&a, &b, span.style);
+                    for (tag, flag) in self.0.tags.char_tags() {
+                        if span.style.has(flag) {
+                            buffer.apply_tag(tag, &a, &b);
+                        }
+                    }
                 }
                 offset += len;
             }
-            offset += if line.eol == Eol::None { 1 } else { line.eol.as_str().len() as i32 };
+            offset += if line.eol == Eol::None {
+                1
+            } else {
+                line.eol.as_str().len() as i32
+            };
+            if line.kind != LineKind::Text && line.kind != LineKind::Raw {
+                let a = buffer.iter_at_offset(line_start);
+                let b = buffer.iter_at_offset(offset);
+                self.apply_kind_tags(first + i, &a, &b);
+            }
         }
-        self.refresh_lines(first.saturating_sub(1), first + lines.len());
+        // the line after may start or continue a list
+        self.apply_line_tags(first + lines.len());
+        self.0.view.queue_draw();
         self.0.state.borrow_mut().programmatic = false;
     }
 
@@ -877,8 +1055,12 @@ impl Editor {
         let before = self.models(first, last);
         let cursor_before = self.0.buffer.cursor_position();
         self.replace_lines(first, before.len(), &lines);
-        self.0.buffer.place_cursor(&self.0.buffer.iter_at_offset(cursor_after));
-        self.0.view.scroll_mark_onscreen(&self.0.buffer.get_insert());
+        self.0
+            .buffer
+            .place_cursor(&self.0.buffer.iter_at_offset(cursor_after));
+        self.0
+            .view
+            .scroll_mark_onscreen(&self.0.buffer.get_insert());
         self.push_step(Step {
             first,
             before,
@@ -915,7 +1097,9 @@ impl Editor {
     }
 
     pub fn undo(&self) {
-        let Some(step) = self.0.state.borrow_mut().undo.pop() else { return };
+        let Some(step) = self.0.state.borrow_mut().undo.pop() else {
+            return;
+        };
         self.replace_lines(step.first, step.after.len(), &step.before);
         self.place_cursor(step.cursor_before);
         self.0.state.borrow_mut().redo.push(step);
@@ -923,7 +1107,9 @@ impl Editor {
     }
 
     pub fn redo(&self) {
-        let Some(step) = self.0.state.borrow_mut().redo.pop() else { return };
+        let Some(step) = self.0.state.borrow_mut().redo.pop() else {
+            return;
+        };
         self.replace_lines(step.first, step.before.len(), &step.after);
         self.place_cursor(step.cursor_after);
         self.0.state.borrow_mut().undo.push(step);
@@ -961,7 +1147,11 @@ impl Editor {
         let Some((start, end)) = buffer.selection_bounds() else {
             let cursor = buffer.iter_at_mark(&buffer.get_insert());
             let current = self.typing_style_at(&cursor);
-            let next = if current.has(flag) { current.without(flag) } else { current.with(flag) };
+            let next = if current.has(flag) {
+                current.without(flag)
+            } else {
+                current.with(flag)
+            };
             self.0.state.borrow_mut().typing_style = Some(next);
             return;
         };
@@ -971,7 +1161,7 @@ impl Editor {
             _ => &self.0.tags.underline,
         };
         let all = {
-            let mut iter = start.clone();
+            let mut iter = start;
             let mut all = true;
             while iter < end {
                 if !iter.ends_line() && !iter.has_tag(tag) {
@@ -986,7 +1176,11 @@ impl Editor {
         self.change(first, last, || {
             if all {
                 buffer.remove_tag(tag, &start, &end);
-                let us = if flag == Style::BOLD { &self.0.tags.bold_us } else { &self.0.tags.italic_us };
+                let us = if flag == Style::BOLD {
+                    &self.0.tags.bold_us
+                } else {
+                    &self.0.tags.italic_us
+                };
                 buffer.remove_tag(us, &start, &end);
             } else {
                 buffer.apply_tag(tag, &start, &end);
@@ -999,7 +1193,11 @@ impl Editor {
     pub fn set_line_kind(&self, kind: LineKind) {
         let (first, last) = self.selected_lines();
         let all = (first..=last).all(|n| self.0.view.kind(n) == kind);
-        let target = if all && kind != LineKind::Text { LineKind::Text } else { kind };
+        let target = if all && kind != LineKind::Text {
+            LineKind::Text
+        } else {
+            kind
+        };
         self.change(first, last, || {
             for n in first..=last {
                 if self.0.view.kind(n) != LineKind::Raw || target != LineKind::Text {
@@ -1014,7 +1212,14 @@ impl Editor {
         let all = (first..=last).all(|n| matches!(self.0.view.kind(n), LineKind::Bullet { .. }));
         self.change(first, last, || {
             for n in first..=last {
-                self.set_kind(n, if all { LineKind::Text } else { LineKind::bullet(0) });
+                self.set_kind(
+                    n,
+                    if all {
+                        LineKind::Text
+                    } else {
+                        LineKind::bullet(0)
+                    },
+                );
             }
         });
     }
@@ -1028,8 +1233,15 @@ impl Editor {
         self.change(first, last, || {
             for n in first..=last {
                 if let LineKind::Bullet { indent, marker } = self.0.view.kind(n) {
-                    let indent = (indent as i32 + 2 * delta).clamp(0, 2 * (LEVELS as i32 - 1)) as u8;
-                    self.set_kind(n, LineKind::Bullet { indent: indent / 2 * 2, marker });
+                    let indent =
+                        (indent as i32 + 2 * delta).clamp(0, 2 * (LEVELS as i32 - 1)) as u8;
+                    self.set_kind(
+                        n,
+                        LineKind::Bullet {
+                            indent: indent / 2 * 2,
+                            marker,
+                        },
+                    );
                 }
             }
         });
@@ -1042,11 +1254,9 @@ impl Editor {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = self.downgrade();
-        keys.connect_key_pressed(move |_, key, code, state| {
-            match upgrade(&weak) {
-                Some(editor) if editor.key(key, code, state) => glib::Propagation::Stop,
-                _ => glib::Propagation::Proceed,
-            }
+        keys.connect_key_pressed(move |_, key, code, state| match upgrade(&weak) {
+            Some(editor) if editor.key(key, code, state) => glib::Propagation::Stop,
+            _ => glib::Propagation::Proceed,
         });
         self.0.view.add_controller(keys);
     }
@@ -1110,7 +1320,9 @@ impl Editor {
 
     /// `- ` / `* ` start a bullet, `# ` / `## ` a heading.
     fn autoformat(&self) -> bool {
-        let Some((line, cursor)) = self.cursor_line() else { return false };
+        let Some((line, cursor)) = self.cursor_line() else {
+            return false;
+        };
         if self.0.view.kind(line) != LineKind::Text {
             return false;
         }
@@ -1124,7 +1336,10 @@ impl Editor {
         };
         self.change(line, line, || {
             let mut a = self.line_start(line);
-            let mut b = self.0.buffer.iter_at_offset(a.offset() + typed.chars().count() as i32);
+            let mut b = self
+                .0
+                .buffer
+                .iter_at_offset(a.offset() + typed.chars().count() as i32);
             self.0.buffer.delete(&mut a, &mut b);
             self.set_kind(line, kind);
         });
@@ -1133,7 +1348,9 @@ impl Editor {
 
     /// Enter on an empty bullet ends the list.
     fn enter(&self) -> bool {
-        let Some((line, cursor)) = self.cursor_line() else { return false };
+        let Some((line, cursor)) = self.cursor_line() else {
+            return false;
+        };
         let is_bullet = matches!(self.0.view.kind(line), LineKind::Bullet { .. });
         if is_bullet && cursor.line_offset() == 0 && cursor.ends_line() {
             self.change(line, line, || self.set_kind(line, LineKind::Text));
@@ -1145,13 +1362,18 @@ impl Editor {
     /// Backspace at the start of a bullet outdents it, then turns it into
     /// text; at the start of a heading it turns it into text.
     fn backspace(&self) -> bool {
-        let Some((line, cursor)) = self.cursor_line() else { return false };
+        let Some((line, cursor)) = self.cursor_line() else {
+            return false;
+        };
         if cursor.line_offset() != 0 {
             return false;
         }
         match self.0.view.kind(line) {
             LineKind::Bullet { indent, marker } if indent >= 2 => {
-                let kind = LineKind::Bullet { indent: indent - 2, marker };
+                let kind = LineKind::Bullet {
+                    indent: indent - 2,
+                    marker,
+                };
                 self.change(line, line, || self.set_kind(line, kind));
             }
             LineKind::Bullet { .. } | LineKind::H1 | LineKind::H2 => {
@@ -1196,7 +1418,9 @@ impl Editor {
     }
 
     fn copy(&self) -> bool {
-        let Some((start, end)) = self.0.buffer.selection_bounds() else { return false };
+        let Some((start, end)) = self.0.buffer.selection_bounds() else {
+            return false;
+        };
         let mut lines = self.models(start.line() as usize, end.line() as usize);
         let count = lines.len();
         let end_offset = end.line_offset() as usize;
@@ -1220,7 +1444,10 @@ impl Editor {
         if start.line_offset() > 0 && lines[0].kind != LineKind::Raw {
             lines[0].kind = LineKind::Text;
         }
-        self.0.view.clipboard().set_text(&markdown::serialize(&lines));
+        self.0
+            .view
+            .clipboard()
+            .set_text(&markdown::serialize(&lines));
         true
     }
 
@@ -1239,6 +1466,22 @@ impl Editor {
         if pasted.is_empty() {
             return;
         }
+        // whitespace kept verbatim by the parser is plain text once pasted
+        for line in pasted.iter_mut().filter(|l| l.kind != LineKind::Raw) {
+            for span in &mut line.spans {
+                if span.text.trim().is_empty() {
+                    span.style = span.style.without(Style::RAW);
+                }
+            }
+        }
+        // text ending in a line break leaves the cursor on a fresh line
+        if pasted.last().is_some_and(|l| l.eol != Eol::None) {
+            pasted.push(Line {
+                kind: LineKind::Text,
+                spans: Vec::new(),
+                eol: Eol::None,
+            });
+        }
         let n = pasted.len();
 
         // first pasted line joins what is left of the cursor
@@ -1253,7 +1496,11 @@ impl Editor {
         pasted[0].kind = first_kind;
 
         // the rest of the current line follows the last pasted line
-        let cursor_chars: usize = pasted[n - 1].spans.iter().map(|s| s.text.chars().count()).sum();
+        let cursor_chars: usize = pasted[n - 1]
+            .spans
+            .iter()
+            .map(|s| s.text.chars().count())
+            .sum();
         let mut last_spans = std::mem::take(&mut pasted[n - 1].spans);
         last_spans.extend(right);
         pasted[n - 1].spans = markdown::merge(last_spans);
@@ -1325,17 +1572,22 @@ impl Editor {
             return;
         }
         let weak = self.downgrade();
-        state.toolbar_timer = Some(glib::timeout_add_local_once(Duration::from_millis(180), move || {
-            if let Some(editor) = upgrade(&weak) {
-                editor.0.state.borrow_mut().toolbar_timer = None;
-                editor.show_toolbar();
-            }
-        }));
+        state.toolbar_timer = Some(glib::timeout_add_local_once(
+            Duration::from_millis(180),
+            move || {
+                if let Some(editor) = upgrade(&weak) {
+                    editor.0.state.borrow_mut().toolbar_timer = None;
+                    editor.show_toolbar();
+                }
+            },
+        ));
     }
 
     fn show_toolbar(&self) {
         let view = &self.0.view;
-        let Some((start, _)) = self.0.buffer.selection_bounds() else { return };
+        let Some((start, _)) = self.0.buffer.selection_bounds() else {
+            return;
+        };
         if !view.is_mapped() {
             return;
         }
@@ -1344,7 +1596,12 @@ impl Editor {
         let (y, _) = view.glyph_box(&a);
         let (x, y) = view.buffer_to_window_coords(gtk::TextWindowType::Widget, a.x(), y as i32);
         // a popover measures as 0; its row plus the 6px side padding is the width
-        let width = self.0.toolbar.child().map_or(0, |c| c.measure(gtk::Orientation::Horizontal, -1).1) + 12;
+        let width = self
+            .0
+            .toolbar
+            .child()
+            .map_or(0, |c| c.measure(gtk::Orientation::Horizontal, -1).1)
+            + 12;
         let x = (x + 7).min(view.width() - width).max(0);
         let rect = gdk::Rectangle::new(x, y, width.max(1), 1);
         self.0.toolbar.set_pointing_to(Some(&rect));
@@ -1377,6 +1634,7 @@ impl Editor {
         }
         buffer.set_text("");
         self.0.view.imp().kinds.replace(vec![LineKind::Text]);
+        self.0.view.imp().cache.replace(vec![None]);
         self.0.state.borrow_mut().programmatic = false;
         self.replace_lines(0, 1, lines);
         let cursor = cursor.clamp(0, buffer.char_count());
@@ -1419,13 +1677,17 @@ impl Editor {
             saved: String::new(),
             dirty: false,
         });
-        let title = Line { kind: LineKind::H1, spans: Vec::new(), eol: Eol::None };
+        let title = Line {
+            kind: LineKind::H1,
+            spans: Vec::new(),
+            eol: Eol::None,
+        };
         self.load(&[title], 0);
         self.emit_status();
     }
 
     /// Saves and forgets the current note. A note created this session and
-    /// left empty goes to the trash.
+    /// left empty is removed again (it holds nothing worth a trash entry).
     pub fn close(&self) {
         self.hide_toolbar();
         self.save_sync();
@@ -1434,15 +1696,18 @@ impl Editor {
             && doc.created
             && is_blank(&doc.saved)
             && let Some(path) = doc.path
+            && std::fs::read_to_string(&path).is_ok_and(|t| is_blank(&t))
         {
-            let _ = storage::trash(&path);
+            let _ = std::fs::remove_file(&path);
         }
     }
 
     pub fn status_path(&self) -> String {
         let state = self.0.state.borrow();
         match state.doc.as_ref() {
-            Some(Doc { path: Some(path), .. }) => config::tilde_path(path),
+            Some(Doc {
+                path: Some(path), ..
+            }) => config::tilde_path(path),
             Some(_) => {
                 drop(state);
                 let slug = storage::slugify(&self.title().unwrap_or_default());
@@ -1454,7 +1719,9 @@ impl Editor {
 
     fn changed(&self) {
         let mut state = self.0.state.borrow_mut();
-        let Some(doc) = state.doc.as_mut() else { return };
+        let Some(doc) = state.doc.as_mut() else {
+            return;
+        };
         doc.dirty = true;
         if let Some(id) = state.save_timer.take() {
             id.remove();
@@ -1521,7 +1788,9 @@ impl Editor {
             self.0.state.borrow_mut().save_again = true;
             return;
         }
-        let Some((path, text)) = self.prepare_save() else { return };
+        let Some((path, text)) = self.prepare_save() else {
+            return;
+        };
         self.emit_status();
         self.0.state.borrow_mut().writing = true;
         let weak = self.downgrade();
@@ -1547,7 +1816,10 @@ impl Editor {
             doc.dirty = true;
             doc.saved.clear();
         }
-        self.emit_error(format!("save failed: {} ({error})", config::tilde_path(path)));
+        self.emit_error(format!(
+            "save failed: {} ({error})",
+            config::tilde_path(path)
+        ));
     }
 
     /// Saves right now, blocking. Used when hiding, closing and quitting.
@@ -1568,11 +1840,19 @@ impl Editor {
     pub fn file_changed(&self, path: &Path) {
         let (cursor, final_eol) = {
             let state = self.0.state.borrow();
-            let Some(doc) = state.doc.as_ref() else { return };
-            if doc.path.as_deref() != Some(path) || doc.dirty || state.writing || state.save_timer.is_some() {
+            let Some(doc) = state.doc.as_ref() else {
+                return;
+            };
+            if doc.path.as_deref() != Some(path)
+                || doc.dirty
+                || state.writing
+                || state.save_timer.is_some()
+            {
                 return;
             }
-            let Ok(text) = std::fs::read_to_string(path) else { return };
+            let Ok(text) = std::fs::read_to_string(path) else {
+                return;
+            };
             if text == doc.saved {
                 return;
             }
@@ -1633,7 +1913,11 @@ fn split_spans(spans: &[Span], at: usize) -> (Vec<Span>, Vec<Span>) {
         } else if pos >= at {
             right.push(span.clone());
         } else {
-            let cut = span.text.char_indices().nth(at - pos).map_or(span.text.len(), |(i, _)| i);
+            let cut = span
+                .text
+                .char_indices()
+                .nth(at - pos)
+                .map_or(span.text.len(), |(i, _)| i);
             left.push(Span::new(&span.text[..cut], span.style));
             right.push(Span::new(&span.text[cut..], span.style));
         }
@@ -1659,10 +1943,19 @@ mod tests {
 
     #[test]
     fn splits_spans() {
-        let spans = vec![Span::new("héllo", Style::BOLD), Span::new(" world", Style::NONE)];
+        let spans = vec![
+            Span::new("héllo", Style::BOLD),
+            Span::new(" world", Style::NONE),
+        ];
         let (l, r) = split_spans(&spans, 2);
         assert_eq!(l, vec![Span::new("hé", Style::BOLD)]);
-        assert_eq!(r, vec![Span::new("llo", Style::BOLD), Span::new(" world", Style::NONE)]);
+        assert_eq!(
+            r,
+            vec![
+                Span::new("llo", Style::BOLD),
+                Span::new(" world", Style::NONE)
+            ]
+        );
     }
 
     #[test]
@@ -1670,5 +1963,244 @@ mod tests {
         assert!(is_blank("# \n"));
         assert!(is_blank(""));
         assert!(!is_blank("# a"));
+    }
+
+    // -- the editor itself, driven like a user would (no window needed) ----------
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kludd-editor-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Types like the keyboard does: text goes in at the cursor through the
+    /// interactive path, Enter/Space/Backspace get Kludd's key handling.
+    fn type_text(editor: &Editor, text: &str) {
+        let buffer = &editor.0.buffer;
+        for c in text.chars() {
+            let handled = match c {
+                ' ' => editor.autoformat(),
+                '\n' => editor.enter(),
+                _ => false,
+            };
+            if !handled {
+                buffer.insert_interactive_at_cursor(&c.to_string(), true);
+            }
+        }
+    }
+
+    fn select(editor: &Editor, from: i32, to: i32) {
+        let buffer = &editor.0.buffer;
+        buffer.select_range(&buffer.iter_at_offset(from), &buffer.iter_at_offset(to));
+    }
+
+    fn find(editor: &Editor, needle: &str) -> i32 {
+        let buffer = &editor.0.buffer;
+        let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+        text[..text.find(needle).unwrap()].chars().count() as i32
+    }
+
+    /// The cached Markdown must always equal a fresh serialization.
+    fn check_cache(editor: &Editor) {
+        let cached = editor.text();
+        editor
+            .0
+            .view
+            .imp()
+            .cache
+            .borrow_mut()
+            .iter_mut()
+            .for_each(|c| *c = None);
+        assert_eq!(cached, editor.text(), "line cache went stale");
+    }
+
+    /// GTK needs one thread and a display, so all editor checks share one
+    /// test. Without a display (CI) it is skipped.
+    #[test]
+    fn editor_behaves_like_a_notepad() {
+        if gtk::init().is_err() {
+            eprintln!("no display: skipping GTK editor test");
+            return;
+        }
+        let dir = temp_dir("notes");
+        let editor = Editor::new(dir.clone());
+
+        // a new note starts on an empty title line
+        editor.new_note();
+        type_text(
+            &editor,
+            "Things to fix\nCall the dentist before Friday.\n- Buy milk\nPush to GitHub\n\nLater",
+        );
+        assert_eq!(
+            editor.text(),
+            "# Things to fix\nCall the dentist before Friday.\n- Buy milk\n- Push to GitHub\nLater\n",
+            "Enter after a heading gives text, '- ' starts a bullet, Enter on an empty bullet ends the list"
+        );
+
+        // formatting a selection, and Ctrl+2 on a line
+        let at = find(&editor, "dentist");
+        select(&editor, at, at + 7);
+        editor.toggle_style(Style::BOLD);
+        let at = find(&editor, "Friday");
+        select(&editor, at, at + 6);
+        editor.toggle_style(Style::UNDERLINE);
+        let at = find(&editor, "Later");
+        editor.place_cursor(at);
+        editor.set_line_kind(LineKind::H2);
+        let expected = "# Things to fix\nCall the **dentist** before <u>Friday</u>.\n- Buy milk\n- Push to GitHub\n## Later\n";
+        assert_eq!(editor.text(), expected);
+
+        check_cache(&editor);
+        // typing continues the formatting it starts in
+        let at = find(&editor, "dentist") + 7;
+        editor.place_cursor(at);
+        type_text(&editor, "s");
+        assert!(editor.text().contains("**dentists**"));
+        editor.undo();
+        assert_eq!(editor.text(), expected);
+
+        // undo/redo covers formatting, not just text
+        editor.undo(); // ## Later -> Later
+        editor.undo(); // underline
+        assert_eq!(
+            editor.text(),
+            "# Things to fix\nCall the **dentist** before Friday.\n- Buy milk\n- Push to GitHub\nLater\n"
+        );
+        editor.redo();
+        editor.redo();
+        assert_eq!(editor.text(), expected);
+
+        check_cache(&editor);
+        // Tab / Shift+Tab nest bullets
+        let at = find(&editor, "Push");
+        editor.place_cursor(at);
+        assert!(editor.indent_bullets(1));
+        assert!(editor.text().contains("- Buy milk\n  - Push to GitHub\n"));
+        assert!(editor.indent_bullets(-1));
+        assert!(editor.backspace(), "Backspace at the start of a bullet");
+        assert!(editor.text().contains("- Buy milk\nPush to GitHub\n"));
+        editor.undo();
+        assert_eq!(editor.text(), expected);
+
+        check_cache(&editor);
+        // saving names the file after the title, atomically
+        editor.save_sync();
+        let path = dir.join("things-to-fix.md");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no temp files left behind"
+        );
+
+        // renaming the title renames the file, avoiding collisions
+        std::fs::write(dir.join("chores.md"), "# Chores\n").unwrap();
+        editor.place_cursor(find(&editor, "Things to fix") + 13);
+        for _ in 0..13 {
+            editor.0.buffer.backspace(
+                &mut editor.0.buffer.iter_at_mark(&editor.0.buffer.get_insert()),
+                true,
+                true,
+            );
+        }
+        type_text(&editor, "Chores");
+        editor.save_sync();
+        assert!(!path.exists());
+        let renamed = dir.join("chores-2.md");
+        assert!(editor.text().starts_with("# Chores\n"));
+        assert_eq!(std::fs::read_to_string(&renamed).unwrap(), editor.text());
+
+        check_cache(&editor);
+        // pasting Markdown pastes formatting
+        editor.place_cursor(editor.0.buffer.char_count());
+        editor.paste(" *now*");
+        type_text(&editor, "\n");
+        editor.paste("one *two*\n- three\n");
+        assert!(
+            editor
+                .text()
+                .ends_with("## Later *now*\none *two*\n- three\n\n"),
+            "{:?}",
+            editor.text()
+        );
+        editor.undo();
+        assert!(
+            editor.text().ends_with("## Later *now*\n\n"),
+            "{}",
+            editor.text()
+        );
+
+        check_cache(&editor);
+        // an edit made elsewhere (say, nvim) is picked up
+        editor.save_sync();
+        std::fs::write(&renamed, "# Chores\nchanged outside\n").unwrap();
+        editor.file_changed(&renamed);
+        assert_eq!(editor.text(), "# Chores\nchanged outside\n");
+
+        // opening an outside file and saving it changes nothing
+        let outside = temp_dir("outside").join("README.md");
+        let readme = "Intro\r\n\r\n```sh\ncargo build\n```\n\n| a | b |\n|---|---|\n\n1. one\n2. two\n[link](x) and **bold**";
+        std::fs::write(&outside, readme).unwrap();
+        editor.open(&outside, false).unwrap();
+        assert_eq!(editor.text(), readme);
+        editor.place_cursor(editor.0.buffer.char_count());
+        type_text(&editor, "!");
+        editor.save_sync();
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            format!("{readme}!")
+        );
+        assert!(
+            outside.exists() && !dir.join("readme.md").exists(),
+            "outside files are never moved"
+        );
+
+        check_cache(&editor);
+        // a new note left empty leaves nothing behind
+        editor.new_note();
+        type_text(&editor, "x");
+        editor.save_sync();
+        assert!(dir.join("x.md").exists());
+        editor.undo();
+        editor.close();
+        assert!(!dir.join("x.md").exists());
+
+        // performance: a 5 000 line note
+        let mut big = String::new();
+        for i in 0..5_000 {
+            match i % 5 {
+                0 => big.push_str(&format!("## Section {i}\n")),
+                1 => big.push_str(&format!("- item **{i}** with *style*\n")),
+                2 => {
+                    big.push_str("plain text line that is long enough to wrap a little bit maybe\n")
+                }
+                3 => big.push_str("`code` and [a link](https://example.com)\n"),
+                _ => big.push('\n'),
+            }
+        }
+        let big_path = dir.join("big.md");
+        std::fs::write(&big_path, &big).unwrap();
+        let t = Instant::now();
+        editor.open(&big_path, true).unwrap();
+        let open = t.elapsed();
+        assert_eq!(editor.text(), big);
+        let t = Instant::now();
+        editor.place_cursor(find(&editor, "Section 2500"));
+        for _ in 0..200 {
+            type_text(&editor, "a");
+        }
+        let per_key = t.elapsed() / 200;
+        check_cache(&editor);
+        let _ = editor.text();
+        let t = Instant::now();
+        let _ = editor.text();
+        let serialize = t.elapsed();
+        eprintln!("5000 lines: open {open:?}, per keystroke {per_key:?}, serialize {serialize:?}");
+        assert!(
+            per_key < Duration::from_millis(4),
+            "typing too slow: {per_key:?}"
+        );
+        editor.close();
     }
 }
