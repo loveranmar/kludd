@@ -48,5 +48,5 @@ case ":$PATH:" in
 esac
 if pgrep -x kludd >/dev/null 2>&1; then
     echo "Kludd is running the old version. Restart it with:"
-    echo "  $BIN --quit; hyprctl dispatch exec '[workspace special:kludd silent] $BIN --hidden'"
+    echo "  $BIN --quit; hyprctl dispatch exec '$BIN --hidden'"
 fi

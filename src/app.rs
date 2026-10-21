@@ -3,6 +3,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::ops::ControlFlow;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
@@ -47,6 +48,29 @@ pub fn run() -> glib::ExitCode {
             }
         }
         return glib::ExitCode::SUCCESS;
+    }
+
+    // Hyprland notes the workspace a process is started from (and any
+    // `[workspace …]` exec rule) in its environment and moves the first
+    // window there without switching to it. Kludd started at login shows
+    // its window much later, wherever the hotkey is pressed, so the note
+    // would send it to the login workspace, out of sight. Start over without
+    // it, before Hyprland reads it from /proc when the window appears.
+    const HYPRLAND_TOKENS: [&str; 2] = ["HL_INITIAL_WORKSPACE_TOKEN", "HL_EXEC_RULE_TOKEN"];
+    if std::env::args().skip(1).any(|a| a == "--hidden")
+        && HYPRLAND_TOKENS
+            .iter()
+            .any(|t| std::env::var_os(t).is_some())
+        && let Ok(exe) = std::env::current_exe()
+    {
+        let mut restart = std::process::Command::new(exe);
+        restart.args(std::env::args_os().skip(1));
+        for token in HYPRLAND_TOKENS {
+            restart.env_remove(token);
+        }
+        // only returns if the restart failed; then carry on as we are
+        let error = restart.exec();
+        eprintln!("kludd: could not drop Hyprland's workspace token: {error}");
     }
 
     let app = gtk::Application::builder()
