@@ -8,5 +8,5 @@ Icon=io.github.loveranmar.Kludd
 Terminal=false
 Categories=Utility;TextEditor;GTK;
 Keywords=notes;markdown;notepad;
-MimeType=text/markdown;
+MimeType=text/markdown;text/plain;
 StartupWMClass=io.github.loveranmar.Kludd

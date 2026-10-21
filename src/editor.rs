@@ -383,6 +383,9 @@ struct Doc {
     managed: bool,
     /// Created in this session; trashed again if left empty.
     created: bool,
+    /// Plain text, not Markdown (a `.txt`): every line is raw, there is no
+    /// formatting, and the file is saved exactly as typed.
+    plain: bool,
     final_eol: Eol,
     /// Line break this note uses (CRLF files stay CRLF when typing Enter).
     newline: Eol,
@@ -677,19 +680,22 @@ impl Editor {
 
     /// The whole note as Markdown.
     pub fn text(&self) -> String {
-        let final_eol = self
+        let (final_eol, plain_file) = self
             .0
             .state
             .borrow()
             .doc
             .as_ref()
-            .map_or(Eol::Lf, |d| d.final_eol);
+            .map_or((Eol::Lf, false), |d| (d.final_eol, d.plain));
         let count = self.line_count();
         self.check_line_table();
         // line endings straight from the text: one copy instead of thousands
         // of iterator walks
         let buffer = &self.0.buffer;
         let plain = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+        if plain_file {
+            return format!("{plain}{}", final_eol.as_str());
+        }
         let eols: Vec<Eol> = markdown::split_lines(&plain)
             .into_iter()
             .map(|(_, eol)| eol)
@@ -1252,6 +1258,11 @@ impl Editor {
         self.0.view.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
     }
 
+    /// The open file is plain text: it has no formatting to change.
+    fn plain(&self) -> bool {
+        self.0.state.borrow().doc.as_ref().is_some_and(|d| d.plain)
+    }
+
     fn newline(&self) -> Eol {
         self.0
             .state
@@ -1288,6 +1299,9 @@ impl Editor {
     // -- formatting commands -------------------------------------------------
 
     pub fn toggle_style(&self, flag: Style) {
+        if self.plain() {
+            return;
+        }
         let buffer = &self.0.buffer;
         let Some((start, end)) = buffer.selection_bounds() else {
             let cursor = buffer.iter_at_mark(&buffer.get_insert());
@@ -1336,6 +1350,9 @@ impl Editor {
     /// H1 / H2 / plain text for the selected lines; choosing the kind they
     /// already have turns them back into text.
     pub fn set_line_kind(&self, kind: LineKind) {
+        if self.plain() {
+            return;
+        }
         let (first, last) = self.selected_lines();
         let all = (first..=last).all(|n| self.0.view.kind(n) == kind);
         let target = if all && kind != LineKind::Text {
@@ -1353,6 +1370,9 @@ impl Editor {
     }
 
     pub fn toggle_bullets(&self) {
+        if self.plain() {
+            return;
+        }
         let (first, last) = self.selected_lines();
         let all = (first..=last).all(|n| matches!(self.0.view.kind(n), LineKind::Bullet { .. }));
         self.change(first, last, || {
@@ -1608,7 +1628,7 @@ impl Editor {
         true
     }
 
-    /// Pasted text is read as Markdown.
+    /// Pasted text is read as Markdown (as plain text in a plain file).
     fn paste(&self, text: &str) {
         let buffer = &self.0.buffer;
         if buffer.has_selection() {
@@ -1619,7 +1639,8 @@ impl Editor {
         let offset = cursor.line_offset() as usize;
         let current = self.line_model(line);
         let (left, right) = split_spans(&current.spans, offset);
-        let mut pasted = markdown::parse(text);
+        let plain = self.plain();
+        let mut pasted = parse(text, plain);
         if pasted.is_empty() {
             return;
         }
@@ -1634,7 +1655,7 @@ impl Editor {
         // text ending in a line break leaves the cursor on a fresh line
         if pasted.last().is_some_and(|l| l.eol != Eol::None) {
             pasted.push(Line {
-                kind: LineKind::Text,
+                kind: if plain { LineKind::Raw } else { LineKind::Text },
                 spans: Vec::new(),
                 eol: Eol::None,
             });
@@ -1852,7 +1873,7 @@ impl Editor {
             id.remove();
         }
         let dragging = self.0.state.borrow().pointer_down;
-        if !self.0.buffer.has_selection() || dragging {
+        if !self.0.buffer.has_selection() || dragging || self.plain() {
             self.0.toolbar.popdown();
             return;
         }
@@ -1972,18 +1993,21 @@ impl Editor {
     }
 
     /// Opens a file. `managed` notes (inside the notes folder) are renamed
-    /// after their title; others are edited where they are.
+    /// after their title; others are edited where they are. Plain text has
+    /// no title, so it keeps its name.
     pub fn open(&self, path: &Path, managed: bool) -> std::io::Result<()> {
         self.close();
         let text = std::fs::read_to_string(path)?;
-        let lines = markdown::parse(&text);
+        let plain = !storage::is_markdown(path);
+        let lines = parse(&text, plain);
         let final_eol = lines.last().map_or(Eol::None, |l| l.eol);
         let crlf = lines.iter().filter(|l| l.eol == Eol::CrLf).count();
         let lf = lines.iter().filter(|l| l.eol == Eol::Lf).count();
         self.0.state.borrow_mut().doc = Some(Doc {
             path: Some(path.to_path_buf()),
-            managed,
+            managed: managed && !plain,
             created: false,
+            plain,
             final_eol,
             newline: if crlf > lf { Eol::CrLf } else { Eol::Lf },
             saved: text.clone(),
@@ -2005,6 +2029,7 @@ impl Editor {
             path: None,
             managed: true,
             created: true,
+            plain: false,
             final_eol: Eol::Lf,
             newline: Eol::Lf,
             saved: String::new(),
@@ -2192,8 +2217,9 @@ impl Editor {
             if text == doc.saved {
                 return;
             }
+            let plain = doc.plain;
             drop(state);
-            let lines = markdown::parse(&text);
+            let lines = parse(&text, plain);
             let final_eol = lines.last().map_or(Eol::None, |l| l.eol);
             let cursor = self.0.buffer.cursor_position();
             self.load(&lines, cursor);
@@ -2211,6 +2237,14 @@ impl Editor {
 
 fn upgrade(weak: &Weak<Inner>) -> Option<Editor> {
     weak.upgrade().map(Editor)
+}
+
+fn parse(text: &str, plain: bool) -> Vec<Line> {
+    if plain {
+        markdown::parse_plain(text)
+    } else {
+        markdown::parse(text)
+    }
 }
 
 /// Line breaks as GTK counts them (`\r\n` is one).
@@ -2536,6 +2570,37 @@ mod tests {
         editor.save_sync();
         let saved = std::fs::read_to_string(&crlf).unwrap();
         assert_eq!(saved, "# Dos\r\nline\r\nnewa\r\nb\r\n");
+
+        // a .txt is plain text: nothing in it is Markdown, and it keeps its
+        // name even in the notes folder
+        let txt = dir.join("todo.txt");
+        let plain = "# not a title\r\n- not a bullet\r\n**not bold** 5 \\* 3\r\n";
+        std::fs::write(&txt, plain).unwrap();
+        editor.open(&txt, true).unwrap();
+        assert!((0..editor.line_count()).all(|n| editor.0.view.kind(n) == LineKind::Raw));
+        assert_eq!(editor.text(), plain);
+        select(&editor, 0, 5);
+        editor.toggle_style(Style::BOLD);
+        editor.set_line_kind(LineKind::H1);
+        editor.toggle_bullets();
+        assert_eq!(editor.text(), plain, "no formatting in plain text");
+        editor.place_cursor(editor.0.buffer.char_count());
+        type_text(&editor, "\n- a *b* \\c\n# d");
+        editor.paste("**e**\n## f\n");
+        editor.save_sync();
+        let typed = format!("{plain}- a *b* \\c\r\n# d**e**\r\n## f\r\n\r\n");
+        assert_eq!(std::fs::read_to_string(&txt).unwrap(), typed);
+        assert!(!dir.join("not-a-title.md").exists(), "never renamed");
+        assert!((0..editor.line_count()).all(|n| editor.0.view.kind(n) == LineKind::Raw));
+        editor.undo();
+        assert_eq!(editor.text(), format!("{plain}- a *b* \\c\r\n# d\r\n"));
+        editor.redo();
+        editor.save_sync();
+        std::fs::write(&txt, "*changed* outside\n").unwrap();
+        editor.file_changed(&txt);
+        assert_eq!(editor.text(), "*changed* outside\n");
+        assert_eq!(editor.0.view.kind(0), LineKind::Raw);
+        editor.close();
 
         // performance: a 5 000 line note
         let mut big = String::new();

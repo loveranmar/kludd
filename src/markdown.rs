@@ -296,6 +296,15 @@ pub fn raw_line(content: &str, eol: Eol) -> Line {
     }
 }
 
+/// Plain text (a `.txt` file): every line raw, so nothing is formatting
+/// and `\*` stays two characters.
+pub fn parse_plain(src: &str) -> Vec<Line> {
+    split_lines(src)
+        .into_iter()
+        .map(|(range, eol)| raw_line(&src[range], eol))
+        .collect()
+}
+
 /// Recognises the line prefix: `# `, `## `, `<indent>- ` or nothing.
 fn line_prefix(content: &str) -> (LineKind, usize) {
     if content.starts_with("# ") {
@@ -951,6 +960,22 @@ mod tests {
         let line = &parse(src)[0];
         assert_eq!(line.text(), "5 * 3 and _x_");
         assert_eq!(line.kind, LineKind::Text);
+    }
+
+    #[test]
+    fn plain_text_is_never_markdown() {
+        for src in [
+            "# not a heading\r\n- not a bullet\n**not bold** 5 \\* 3\n\n    indented\n",
+            "no final newline",
+            "",
+            "\n\n",
+            "a\rb\r\n",
+        ] {
+            let lines = parse_plain(src);
+            assert!(lines.iter().all(|l| l.kind == LineKind::Raw), "{lines:#?}");
+            assert_eq!(serialize(&lines), src);
+        }
+        assert_eq!(parse_plain("**x**")[0].text(), "**x**");
     }
 
     #[test]

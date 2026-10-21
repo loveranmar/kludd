@@ -22,7 +22,8 @@ Kludd starts once when you log in and waits in the background, so pressing <kbd>
 - **Never mangles a note** — anything unsupported is shown as plain text and written back byte for byte (round-trip tested)
 - **Autosave** — 400 ms after you stop typing and whenever Kludd hides, written atomically
 - **Live reload** — edit a note in nvim and Kludd picks up the change
-- **Any `.md` file** — `kludd notes.md` edits a file in place, and Kludd shows up in "Open with"
+- **Any `.md` or `.txt` file** — `kludd notes.md` edits a file in place, and Kludd shows up in "Open with"
+- **Plain text stays plain** — a `.txt` file shows exactly what it holds: no formatting, saved exactly as typed
 - **Six themes** — pink, yellow, mint, lavender, sky and dark, switched live from the palette button
 - **Big notes stay smooth** — in the test suite a 5 000-line note loads in about 50 ms and a keystroke costs about 0.1 ms
 
@@ -74,7 +75,7 @@ windowrule {
 
 Kludd keeps running in the background with its window hidden, so the hotkey only has to show it. Closing the window (say, your `killactive` bind) hides it again; `kludd --quit` quits for real. If you used `install.sh`, `~/.local/bin` may not be on Hyprland's `PATH`; then write the full path, `/home/you/.local/bin/kludd`.
 
-To open `.md` files with Kludd by default, run `xdg-mime default kludd.desktop text/markdown`.
+To open `.md` and `.txt` files with Kludd by default, run `xdg-mime default kludd.desktop text/markdown text/plain`.
 
 ## Keyboard shortcuts
 
@@ -119,7 +120,9 @@ Every note is a single Markdown file in `notes_dir`, and nothing else is written
 | Bullet | `- text`, two spaces per level |
 | Heading 1 / 2 | `# ` / `## ` |
 
-Files opened from elsewhere are edited where they are and are never renamed. Deleting a note (right-click its card) moves it to the trash.
+`.txt` files in `notes_dir` show up in the notes too, named after the file. They are plain text: `# ` and `**` are just characters, the formatting shortcuts and toolbar are off, and the file is never renamed.
+
+Files opened from elsewhere are edited where they are and are never renamed. Anything that is not a `.md` (or `.markdown`) file is opened as plain text. Deleting a note (right-click its card) moves it to the trash.
 
 ## License
 

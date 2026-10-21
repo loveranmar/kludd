@@ -24,6 +24,7 @@ impl Note {
     }
 }
 
+/// A `.md` or `.txt` file: what the notes list shows.
 pub fn is_note(path: &Path) -> bool {
     let hidden = path
         .file_name()
@@ -32,7 +33,14 @@ pub fn is_note(path: &Path) -> bool {
     !hidden
         && path
             .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+            .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("txt"))
+}
+
+/// Only `.md` files are read as Markdown. Anything else (a `.txt`) is plain
+/// text: nothing in it is formatting, and it is saved exactly as typed.
+pub fn is_markdown(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
 }
 
 /// Lists the notes in `dir`, newest first. Files whose size and mtime did
@@ -70,11 +78,17 @@ pub fn scan(dir: &Path, previous: &[Note]) -> Vec<Note> {
 }
 
 fn note_from(path: PathBuf, text: &str, modified: SystemTime, len: u64) -> Note {
-    let title = markdown::title(text)
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| stem(&path));
+    // plain text has no `# ` title and shows exactly what it holds
+    let (title, shown) = if is_markdown(&path) {
+        let title = markdown::title(text)
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| stem(&path));
+        (title, markdown::searchable(text))
+    } else {
+        (stem(&path), String::new())
+    };
     // match what the note shows, and the raw Markdown as a fallback
-    let haystack = format!("{title}\n{}\n{text}", markdown::searchable(text)).to_lowercase();
+    let haystack = format!("{title}\n{shown}\n{text}").to_lowercase();
     Note {
         path,
         title,
@@ -272,12 +286,15 @@ mod tests {
         std::fs::write(dir.join("one.md"), "# First note\nhello").unwrap();
         std::fs::write(dir.join("two.md"), "no heading here").unwrap();
         std::fs::write(dir.join(".hidden.md"), "# hidden").unwrap();
-        std::fs::write(dir.join("other.txt"), "# nope").unwrap();
+        std::fs::write(dir.join("plain.txt"), "# not a title\nlist").unwrap();
+        std::fs::write(dir.join("other.json"), "nope").unwrap();
         let notes = scan(&dir, &[]);
         let mut titles: Vec<_> = notes.iter().map(|n| n.title.as_str()).collect();
         titles.sort();
-        assert_eq!(titles, ["First note", "two"]);
+        // a .txt is named after its file: `# ` means nothing in plain text
+        assert_eq!(titles, ["First note", "plain", "two"]);
         assert!(notes.iter().any(|n| n.matches("hello")));
+        assert!(notes.iter().any(|n| n.matches("# not a title")));
         assert!(!notes.iter().any(|n| n.matches("nope")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
