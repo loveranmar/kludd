@@ -249,6 +249,16 @@ impl Kludd {
     }
 
     fn connect(self: &Rc<Self>, app: &gtk::Application) {
+        // Left-clicking the path in the status bar copies it.
+        self.status_left.set_cursor_from_name(Some("pointer"));
+        let click = gtk::GestureClick::builder().button(1).build();
+        let weak = Rc::downgrade(self);
+        click.connect_released(move |_, _, _, _| {
+            if let Some(k) = weak.upgrade() {
+                k.copy_status_path();
+            }
+        });
+        self.status_left.add_controller(click);
         let weak = Rc::downgrade(self);
         self.home.connect_open(move |path| {
             if let Some(k) = weak.upgrade() {
@@ -555,6 +565,29 @@ impl Kludd {
             }
             Page::Editor => self.status_right.set_text(&clock()),
         }
+    }
+
+    /// Copies the absolute path shown in the status bar and flashes a
+    /// confirmation. Errors are not paths, so clicking one does nothing.
+    fn copy_status_path(self: &Rc<Self>) {
+        if self.error.borrow().is_some() {
+            return;
+        }
+        let shown = self.status_left.text();
+        let path = config::expand_tilde(shown.trim_end_matches('/'));
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        self.window
+            .clipboard()
+            .set_text(&path.display().to_string());
+        self.status_left.set_text("copied path");
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
+            if let Some(k) = weak.upgrade() {
+                k.update_status();
+            }
+        });
     }
 
     /// Shows an error in the status bar for a few seconds. The beginning
