@@ -4,14 +4,14 @@
 use std::cell::{Cell, RefCell};
 use std::ops::ControlFlow;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use crate::config::{self, Config, MAX_ZOOM, MIN_ZOOM};
+use crate::config::{self, Config, Folder, MAX_ZOOM, MIN_ZOOM};
 use crate::editor::Editor;
 use crate::home::Home;
 use crate::storage::{self, Note};
@@ -133,7 +133,11 @@ pub fn run() -> glib::ExitCode {
     app.connect_open(move |_, files, _| {
         if let Some(k) = slot.borrow().as_ref() {
             if let Some(path) = files.first().and_then(|f| f.path()) {
-                k.open_note(&path);
+                if path.is_dir() {
+                    k.open_dir(&path);
+                } else {
+                    k.open_note(&path);
+                }
             }
             k.show();
         }
@@ -165,8 +169,11 @@ struct Kludd {
     config: RefCell<Config>,
     notes: RefCell<Vec<Note>>,
     page: Cell<Page>,
+    /// The added folder on show, or `None` for the notes folder.
+    folder: RefCell<Option<PathBuf>>,
     shown_once: Cell<bool>,
     dir_monitor: RefCell<Option<gio::FileMonitor>>,
+    folder_monitor: RefCell<Option<gio::FileMonitor>>,
     file_monitor: RefCell<Option<gio::FileMonitor>>,
     rescan_timer: RefCell<Option<glib::SourceId>>,
     error: RefCell<Option<String>>,
@@ -181,7 +188,8 @@ impl Kludd {
         let _ = std::fs::create_dir_all(&notes_dir);
 
         let home = Home::new();
-        let editor = Editor::new(notes_dir);
+        home.set_folders(config.folders.clone());
+        let editor = Editor::new();
         editor.set_zoom(config.zoom);
         editor.set_accent(theme::by_name(&config.theme).accent_rgba());
         home.set_theme(theme::by_name(&config.theme).name);
@@ -234,14 +242,18 @@ impl Kludd {
             config: RefCell::new(config),
             notes: RefCell::new(Vec::new()),
             page: Cell::new(Page::Home),
+            folder: RefCell::new(None),
             shown_once: Cell::new(false),
             dir_monitor: RefCell::new(None),
+            folder_monitor: RefCell::new(None),
             file_monitor: RefCell::new(None),
             rescan_timer: RefCell::new(None),
             error: RefCell::new(None),
         });
         kludd.connect(app);
-        kludd.watch_dir();
+        kludd
+            .dir_monitor
+            .replace(kludd.watch_dir(&kludd.config.borrow().notes_dir()));
         kludd.rescan();
         kludd.start_clock();
         kludd.update_status();
@@ -287,6 +299,40 @@ impl Kludd {
                     ));
                 }
                 k.rescan();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.home.connect_open_folder(move |path| {
+            if let Some(k) = weak.upgrade() {
+                k.open_folder(&path);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.home
+            .connect_add_folder(move |text| match weak.upgrade() {
+                Some(k) => k.add_folder(&text),
+                None => true,
+            });
+        let weak = Rc::downgrade(self);
+        self.home.connect_remove_folder(move |path| {
+            if let Some(k) = weak.upgrade() {
+                k.remove_folder(&path);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.home.connect_folder_color(move |path, color| {
+            if let Some(k) = weak.upgrade() {
+                k.change_folders(|folders| {
+                    for folder in folders.iter_mut().filter(|f| f.dir() == path) {
+                        folder.color = color.map(str::to_string);
+                    }
+                });
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.home.connect_back(move || {
+            if let Some(k) = weak.upgrade() {
+                k.leave_folder();
             }
         });
         let weak = Rc::downgrade(self);
@@ -371,7 +417,7 @@ impl Kludd {
         app.add_action(&toggle);
     }
 
-    fn key(&self, key: gdk::Key, code: u32, state: gdk::ModifierType) -> bool {
+    fn key(self: &Rc<Self>, key: gdk::Key, code: u32, state: gdk::ModifierType) -> bool {
         use gdk::ModifierType as M;
         let mods = state & (M::CONTROL_MASK | M::SHIFT_MASK | M::ALT_MASK | M::SUPER_MASK);
         const KEY_0: u32 = 19;
@@ -401,8 +447,18 @@ impl Kludd {
         if key == gdk::Key::Escape && mods.is_empty() {
             match self.page.get() {
                 Page::Editor => self.go_home(),
+                // one step back at a time: a popover, the folder field, the
+                // search, the added folder, and then Kludd itself
                 Page::Home => {
-                    if !self.home.close_popovers() && !self.home.clear_search() {
+                    let closed = self.home.close_popovers()
+                        || self.home.cancel_add_folder()
+                        || self.home.clear_search();
+                    if closed {
+                        return true;
+                    }
+                    if self.folder.borrow().is_some() {
+                        self.leave_folder();
+                    } else {
                         self.hide();
                     }
                 }
@@ -411,13 +467,13 @@ impl Kludd {
         }
         // typing on the home view starts a search
         if self.page.get() == Page::Home
-            && !self.home.search_is_focused()
+            && !self.home.field_is_focused()
             && (mods.is_empty() || mods == M::SHIFT_MASK)
             && let Some(c) = key.to_unicode()
             && !c.is_control()
             && !c.is_whitespace()
         {
-            self.home.type_into_search(c);
+            self.home.type_into_field(c);
             return true;
         }
         false
@@ -477,6 +533,92 @@ impl Kludd {
         self.update_status();
     }
 
+    /// The folder new notes go into and the home view lists.
+    fn list_dir(&self) -> PathBuf {
+        self.folder
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| self.config.borrow().notes_dir())
+    }
+
+    /// Shows the notes of an added folder.
+    fn open_folder(self: &Rc<Self>, path: &Path) {
+        if !path.is_dir() {
+            self.show_error(format!("folder not found: {}", config::tilde_path(path)));
+            return;
+        }
+        self.folder.replace(Some(path.to_path_buf()));
+        self.home.set_place(Some(path));
+        self.folder_monitor.replace(self.watch_dir(path));
+        self.go_home();
+    }
+
+    /// Back from an added folder to the notes folder.
+    fn leave_folder(self: &Rc<Self>) {
+        self.folder.replace(None);
+        self.home.set_place(None);
+        self.folder_monitor.replace(None);
+        self.go_home();
+    }
+
+    /// `kludd some/folder`: the notes folder itself, or an added folder
+    /// (added now if it is new).
+    fn open_dir(self: &Rc<Self>, path: &Path) {
+        let path: PathBuf = path.components().collect();
+        if same_dir(&path, &self.config.borrow().notes_dir()) {
+            self.leave_folder();
+        } else if self.add_folder(&path.to_string_lossy()) {
+            self.open_folder(&path);
+        }
+    }
+
+    /// Adds a typed folder (saved in the config) and returns true, or shows
+    /// why not and returns false. Nothing typed adds nothing.
+    fn add_folder(self: &Rc<Self>, text: &str) -> bool {
+        // what was wrong with the last try is old news
+        self.clear_error();
+        if text.trim().is_empty() {
+            return true;
+        }
+        let path = config::typed_path(text);
+        let shown = config::tilde_path(&path);
+        if !path.is_dir() {
+            self.show_error(format!("not a folder: {shown}"));
+            return false;
+        }
+        if same_dir(&path, &self.config.borrow().notes_dir()) {
+            self.show_error(format!("{shown} is where your notes already are"));
+            return false;
+        }
+        let known = self
+            .config
+            .borrow()
+            .folders
+            .iter()
+            .any(|f| same_dir(&f.dir(), &path));
+        if !known {
+            self.change_folders(|folders| folders.push(Folder::new(shown)));
+        }
+        true
+    }
+
+    /// Forgets an added folder; the folder and its notes stay as they are.
+    fn remove_folder(&self, path: &Path) {
+        self.change_folders(|folders| folders.retain(|f| f.dir() != path));
+    }
+
+    /// Changes the added folders, saves them and shows the new cards.
+    fn change_folders(&self, change: impl FnOnce(&mut Vec<Folder>)) {
+        let mut config = self.config.borrow_mut();
+        change(&mut config.folders);
+        if let Err(e) = config.save() {
+            eprintln!("kludd: could not save config: {e}");
+        }
+        let folders = config.folders.clone();
+        drop(config);
+        self.home.set_folders(folders);
+    }
+
     fn open_note(self: &Rc<Self>, path: &Path) {
         let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         let notes_dir = self.config.borrow().notes_dir();
@@ -485,7 +627,16 @@ impl Kludd {
             self.show_error(format!("could not open {}: {e}", config::tilde_path(&path)));
             return;
         }
-        *self.file_monitor.borrow_mut() = if managed {
+        // the notes folder and the folder on show are watched already
+        let watched = path.parent().is_some_and(|p| {
+            same_dir(p, &notes_dir)
+                || self
+                    .folder
+                    .borrow()
+                    .as_deref()
+                    .is_some_and(|f| same_dir(p, f))
+        });
+        *self.file_monitor.borrow_mut() = if watched {
             None
         } else {
             self.watch_file(&path)
@@ -494,13 +645,14 @@ impl Kludd {
     }
 
     fn new_note(&self) {
-        self.editor.new_note();
+        self.editor.new_note(&self.list_dir());
         *self.file_monitor.borrow_mut() = None;
         self.show_editor();
     }
 
     fn show_editor(&self) {
         self.home.close_popovers();
+        self.home.cancel_add_folder();
         // the search was for finding this note; home starts fresh next time
         self.home.clear_search();
         self.page.set(Page::Editor);
@@ -551,7 +703,7 @@ impl Kludd {
         } else {
             match self.page.get() {
                 Page::Home => {
-                    let dir = config::tilde_path(&self.config.borrow().notes_dir());
+                    let dir = config::tilde_path(&self.list_dir());
                     self.status_left.set_text(&format!("{dir}/"));
                 }
                 Page::Editor => self.status_left.set_text(&self.editor.status_path()),
@@ -632,7 +784,7 @@ impl Kludd {
     // -- files ------------------------------------------------------------------
 
     fn rescan(&self) {
-        let dir = self.config.borrow().notes_dir();
+        let dir = self.list_dir();
         let notes = storage::scan(&dir, &self.notes.borrow());
         self.notes.replace(notes.clone());
         self.home.set_notes(notes);
@@ -653,13 +805,12 @@ impl Kludd {
         self.rescan_timer.replace(Some(id));
     }
 
-    fn watch_dir(self: &Rc<Self>) {
-        let dir = gio::File::for_path(self.config.borrow().notes_dir());
-        let Ok(monitor) =
-            dir.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
-        else {
-            return;
-        };
+    /// Watches a folder of notes: the notes folder, or the added folder on
+    /// show. Changes reload the open note and the list.
+    fn watch_dir(self: &Rc<Self>, dir: &Path) -> Option<gio::FileMonitor> {
+        let monitor = gio::File::for_path(dir)
+            .monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+            .ok()?;
         let weak = Rc::downgrade(self);
         monitor.connect_changed(move |_, file, other, _| {
             let Some(k) = weak.upgrade() else { return };
@@ -676,7 +827,7 @@ impl Kludd {
                 k.schedule_rescan();
             }
         });
-        self.dir_monitor.replace(Some(monitor));
+        Some(monitor)
     }
 
     /// Watches a note opened from outside the notes folder.

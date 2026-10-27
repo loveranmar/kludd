@@ -379,8 +379,9 @@ struct Step {
 struct Doc {
     /// `None` for a new note that has not been written yet.
     path: Option<PathBuf>,
-    /// Lives in the notes folder, so its file name follows the title.
-    managed: bool,
+    /// The folder of a note whose file name follows its title: notes in the
+    /// notes folder, and notes started in Kludd while they are open.
+    managed: Option<PathBuf>,
     /// Created in this session; trashed again if left empty.
     created: bool,
     /// Plain text, not Markdown (a `.txt`): every line is raw, there is no
@@ -430,7 +431,6 @@ struct Inner {
     buffer: gtk::TextBuffer,
     tags: Tags,
     toolbar: gtk::Popover,
-    notes_dir: RefCell<PathBuf>,
     state: RefCell<State>,
     callbacks: RefCell<Callbacks>,
 }
@@ -439,7 +439,7 @@ struct Inner {
 pub struct Editor(Rc<Inner>);
 
 impl Editor {
-    pub fn new(notes_dir: PathBuf) -> Editor {
+    pub fn new() -> Editor {
         let table = gtk::TextTagTable::new();
         let tags = Tags::new(&table);
         let buffer = gtk::TextBuffer::new(Some(&table));
@@ -506,7 +506,6 @@ impl Editor {
             buffer,
             tags,
             toolbar,
-            notes_dir: RefCell::new(notes_dir),
             state: RefCell::new(State::default()),
             callbacks: RefCell::new(Callbacks::default()),
         }));
@@ -2005,7 +2004,10 @@ impl Editor {
         let lf = lines.iter().filter(|l| l.eol == Eol::Lf).count();
         self.0.state.borrow_mut().doc = Some(Doc {
             path: Some(path.to_path_buf()),
-            managed: managed && !plain,
+            managed: path
+                .parent()
+                .filter(|_| managed && !plain)
+                .map(Path::to_path_buf),
             created: false,
             plain,
             final_eol,
@@ -2022,12 +2024,12 @@ impl Editor {
         Ok(())
     }
 
-    /// Starts a new note with an empty title line.
-    pub fn new_note(&self) {
+    /// Starts a new note in `dir` with an empty title line.
+    pub fn new_note(&self, dir: &Path) {
         self.close();
         self.0.state.borrow_mut().doc = Some(Doc {
             path: None,
-            managed: true,
+            managed: Some(dir.to_path_buf()),
             created: true,
             plain: false,
             final_eol: Eol::Lf,
@@ -2066,12 +2068,15 @@ impl Editor {
             Some(Doc {
                 path: Some(path), ..
             }) => config::tilde_path(path),
-            Some(_) => {
+            Some(Doc {
+                managed: Some(dir), ..
+            }) => {
+                let dir = dir.clone();
                 drop(state);
                 let slug = storage::slugify(&self.title().unwrap_or_default());
-                config::tilde_path(&self.0.notes_dir.borrow().join(format!("{slug}.md")))
+                config::tilde_path(&dir.join(format!("{slug}.md")))
             }
-            None => String::new(),
+            _ => String::new(),
         }
     }
 
@@ -2115,8 +2120,7 @@ impl Editor {
         if doc.path.is_none() && is_blank(&text) {
             return None;
         }
-        if doc.managed {
-            let dir = self.0.notes_dir.borrow().clone();
+        if let Some(dir) = doc.managed.clone() {
             let slug = match title.filter(|t| !t.is_empty()) {
                 Some(title) => Some(storage::slugify(&title)),
                 None if doc.path.is_none() => Some("untitled".to_string()),
@@ -2394,10 +2398,10 @@ mod tests {
             return;
         }
         let dir = temp_dir("notes");
-        let editor = Editor::new(dir.clone());
+        let editor = Editor::new();
 
         // a new note starts on an empty title line
-        editor.new_note();
+        editor.new_note(&dir);
         type_text(
             &editor,
             "Things to fix\nCall the dentist before Friday.\n- Buy milk\nPush to GitHub\n\nLater",
@@ -2528,7 +2532,7 @@ mod tests {
 
         check_cache(&editor);
         // a new note left empty leaves nothing behind
-        editor.new_note();
+        editor.new_note(&dir);
         type_text(&editor, "x");
         editor.save_sync();
         assert!(dir.join("x.md").exists());
@@ -2536,8 +2540,41 @@ mod tests {
         editor.close();
         assert!(!dir.join("x.md").exists());
 
+        // a note started in an added folder is written there and named
+        // after its title while it is open; reopened, it keeps its name
+        let folder = temp_dir("folder");
+        editor.new_note(&folder);
+        assert_eq!(
+            editor.status_path(),
+            config::tilde_path(&folder.join("untitled.md"))
+        );
+        type_text(&editor, "Plan");
+        editor.save_sync();
+        type_text(&editor, "s\nship it");
+        editor.save_sync();
+        let plans = folder.join("plans.md");
+        assert_eq!(
+            std::fs::read_to_string(&plans).unwrap(),
+            "# Plans\nship it\n"
+        );
+        assert!(!folder.join("plan.md").exists() && !dir.join("plans.md").exists());
+        editor.open(&plans, false).unwrap();
+        editor.place_cursor(find(&editor, "Plans") + 5);
+        type_text(&editor, " v2");
+        editor.save_sync();
+        assert_eq!(
+            std::fs::read_to_string(&plans).unwrap(),
+            "# Plans v2\nship it\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(&folder).unwrap().count(),
+            1,
+            "not renamed"
+        );
+        editor.close();
+
         // undo goes back a word at a time, not a whole sentence
-        editor.new_note();
+        editor.new_note(&dir);
         type_text(&editor, "Words\nfirst second third");
         editor.undo();
         assert_eq!(editor.text(), "# Words\nfirst second\n");

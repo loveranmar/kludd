@@ -35,16 +35,20 @@ body{margin:0;padding:40px;background:#f4f2ee;font-family:'Fredoka',sans-serif;d
 .card{background:color-mix(in srgb,var(--ink) 7%,transparent);border-radius:14px;padding:10px 12px;line-height:1.4}
 .card .t{font-weight:500;font-size:14px;margin-bottom:2px}
 .card .d{font-size:11px;opacity:.7}
+/* Added folders: cards of their own above the notes, one gap apart */
+.grid.folders{margin-bottom:8px}
+.card .fi{font-size:14px;vertical-align:-2px;margin-right:6px;font-weight:400}
+.card .d.path{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:rtl;text-align:left}
+.back{font-size:13px;opacity:.7;margin-bottom:4px}
 
 /* Color popover (opened from palette button) */
-.pal{position:absolute;top:56px;right:58px;background:var(--ink);border-radius:14px;padding:8px;display:flex;gap:8px}
+.pal{position:absolute;top:56px;right:96px;background:var(--ink);border-radius:14px;padding:8px;display:flex;gap:8px}
 .sw{width:26px;height:26px;border-radius:50%;border:1px solid rgba(0,0,0,.15);cursor:pointer;padding:0}
 .sw.on{box-shadow:0 0 0 2px var(--ink),0 0 0 4px var(--paper)}
 
 /* Editor view */
 .ed{padding:20px 24px;font-size:15px;line-height:1.55}
 .notch{position:absolute;top:-1px;left:50%;transform:translateX(-50%);width:70px;height:12px;border-radius:0 0 8px 8px;background:color-mix(in srgb,var(--ink) 16%,transparent)}
-.back{font-size:13px;opacity:.7;margin-bottom:4px}
 .ed h1{font-size:20px;font-weight:500;margin:0 0 26px}
 .ed h2{font-size:17px;font-weight:500;margin:10px 0 4px}
 .sel{background:var(--accent);border-radius:4px}
@@ -64,11 +68,16 @@ body{margin:0;padding:40px;background:#f4f2ee;font-family:'Fredoka',sans-serif;d
         <h1>My notes</h1>
         <div class="btns">
           <button class="circle soft" aria-label="Theme"><i class="ti ti-palette"></i></button>
+          <button class="circle soft" aria-label="Add folder"><i class="ti ti-folder-plus"></i></button>
           <button class="circle primary" aria-label="New note"><i class="ti ti-plus"></i></button>
         </div>
       </div>
       <div class="pal" id="pal"></div>
       <div class="search"><i class="ti ti-search" style="font-size:14px;vertical-align:-2px"></i> Search…</div>
+      <div class="grid folders">
+        <div class="card" style="background:#B4A3FF;color:#2A2350"><div class="t"><i class="ti ti-folder fi"></i>notes</div><div class="d path">&lrm;~/code/sheetly/docs</div></div>
+        <div class="card"><div class="t"><i class="ti ti-folder fi"></i>docs</div><div class="d path">&lrm;~/code/kludd</div></div>
+      </div>
       <div class="grid">
         <div class="card"><div class="t">Things to fix</div><div class="d">today 16:12</div></div>
         <div class="card"><div class="t">Sheetly ideas</div><div class="d">yesterday</div></div>
@@ -77,7 +86,28 @@ body{margin:0;padding:40px;background:#f4f2ee;font-family:'Fredoka',sans-serif;d
       </div>
       <div class="sb"><span>~/Kludd/</span><span>4 notes</span></div>
     </div>
-    <div class="cap">Home view (palette popover shown open)</div>
+    <div class="cap">Home view (palette popover shown open, two added folders, one coloured lavender: a folder colour is that theme's accent and ink, whatever the theme)</div>
+  </div>
+
+  <div>
+    <div class="w home">
+      <div class="back"><i class="ti ti-arrow-left" style="font-size:14px;vertical-align:-2px"></i> My notes</div>
+      <div class="head">
+        <h1>notes</h1>
+        <div class="btns">
+          <button class="circle soft" aria-label="Theme"><i class="ti ti-palette"></i></button>
+          <button class="circle primary" aria-label="New note"><i class="ti ti-plus"></i></button>
+        </div>
+      </div>
+      <div class="search"><i class="ti ti-search" style="font-size:14px;vertical-align:-2px"></i> Search…</div>
+      <div class="grid">
+        <div class="card"><div class="t">Sheetly roadmap</div><div class="d">today 16:40</div></div>
+        <div class="card"><div class="t">Pricing</div><div class="d">yesterday</div></div>
+        <div class="card"><div class="t">todo</div><div class="d">11 Oct</div></div>
+      </div>
+      <div class="sb"><span>~/code/sheetly/docs/notes/</span><span>3 notes</span></div>
+    </div>
+    <div class="cap">Folder view (an added folder opened; the folder button becomes a path field while adding)</div>
   </div>
 
   <div>

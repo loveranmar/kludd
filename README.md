@@ -23,6 +23,7 @@ Kludd starts once when you log in and waits in the background, so pressing <kbd>
 - **Autosave** — 400 ms after you stop typing and whenever Kludd hides, written atomically
 - **Live reload** — edit a note in nvim and Kludd picks up the change
 - **Any `.md` or `.txt` file** — `kludd notes.md` edits a file in place, and Kludd shows up in "Open with"
+- **Folders** — add any folder, like a project's `docs/notes`, and its notes get a view of their own; new notes can start right there
 - **Plain text stays plain** — a `.txt` file shows exactly what it holds: no formatting, saved exactly as typed
 - **Six themes** — pink, yellow, mint, lavender, sky and dark, switched live from the palette button
 - **Big notes stay smooth** — in the test suite a 5 000-line note loads in about 50 ms and a keystroke costs about 0.1 ms
@@ -82,9 +83,9 @@ To open `.md` and `.txt` files with Kludd by default, run `xdg-mime default klud
 | Keys | Action |
 |------|--------|
 | <kbd>Home</kbd> | Show Kludd, or hide it (the Hyprland bind above) |
-| <kbd>Ctrl</kbd>+<kbd>N</kbd> | New note |
+| <kbd>Ctrl</kbd>+<kbd>N</kbd> | New note (in the folder on show) |
 | <kbd>Ctrl</kbd>+<kbd>F</kbd> | Search notes (or just start typing on the notes view) |
-| <kbd>Esc</kbd> | Back to the notes, or hide Kludd |
+| <kbd>Esc</kbd> | Back to the notes, out of a folder, or hide Kludd |
 | <kbd>Ctrl</kbd>+<kbd>B</kbd> / <kbd>I</kbd> / <kbd>U</kbd> | Bold / italic / underline |
 | <kbd>Ctrl</kbd>+<kbd>1</kbd> / <kbd>2</kbd> | Heading 1 / heading 2 |
 | <kbd>Ctrl</kbd>+<kbd>0</kbd> | Normal text |
@@ -96,16 +97,20 @@ To open `.md` and `.txt` files with Kludd by default, run `xdg-mime default klud
 
 Typing `- ` or `* ` at the start of a line makes a bullet, `# ` and `## ` make headings, and Enter on an empty bullet ends the list. Select text to get the floating **B** *I* <u>U</u> • H1 H2 toolbar.
 
-From a terminal, `kludd` shows the running Kludd, `kludd file.md` opens a file in it, `kludd --toggle` shows or hides it, and `kludd --quit` saves and quits.
+From a terminal, `kludd` shows the running Kludd, `kludd file.md` opens a file in it, `kludd ~/code/app/notes` adds that folder and shows its notes, `kludd --toggle` shows or hides it, and `kludd --quit` saves and quits.
 
 ## Configuration
 
-`~/.config/kludd/config.toml` is created when you first change the theme or zoom:
+`~/.config/kludd/config.toml` is created when you first change the theme or zoom, or add a folder:
 
 ```toml
-notes_dir = "~/Kludd"  # where notes live
-theme = "pink"         # pink, yellow, mint, lavender, sky or dark
-zoom = 1.0             # editor zoom, changed with Ctrl +/-
+notes_dir = "~/Kludd"       # where notes live
+theme = "pink"              # pink, yellow, mint, lavender, sky or dark
+zoom = 1.0                  # editor zoom, changed with Ctrl +/-
+
+[[folders]]                 # an added folder, see Folders below
+path = "~/code/app/notes"
+color = "mint"              # its card's colour, a theme name (optional)
 ```
 
 ## How notes are stored
@@ -124,9 +129,15 @@ Every note is a single Markdown file in `notes_dir`, and nothing else is written
 
 Files opened from elsewhere are edited where they are and are never renamed. Anything that is not a `.md` (or `.markdown`) file is opened as plain text. Deleting a note (right-click its card) moves it to the trash.
 
+## Folders
+
+Notes that live somewhere else, like a project's `docs/notes`, can have a place in Kludd too. Press the folder button next to **+**, type the folder's path (<kbd>Tab</kbd> completes folder names) and press <kbd>Enter</kbd>, or run `kludd ~/code/app/notes`. The folder gets a card above your notes; click it to see the `.md` and `.txt` files in it (not those in its subfolders), and press **+** there to start a note in that folder. Everything else stays in `notes_dir`.
+
+Files in an added folder are edited where they are and keep their names, so links to them keep working. Only a note you start in Kludd is named after its title, while you write it. Right-click a folder card to give it a colour: each dot is one of the themes' accents, and the first one makes the card plain again. *Remove from Kludd*, in the same menu, takes the folder off the list; the folder and its files are left alone.
+
 ## License
 
-[MIT](LICENSE): use, change and share Kludd freely; just keep the copyright notice. Kludd bundles the [Fredoka](https://github.com/hafontia/Fredoka-One) font ([OFL 1.1](assets/fonts/OFL.txt)) and four [Tabler Icons](https://tabler.io/icons) ([MIT](assets/icons/LICENSE-tabler)). Contributions are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md).
+[MIT](LICENSE): use, change and share Kludd freely; just keep the copyright notice. Kludd bundles the [Fredoka](https://github.com/hafontia/Fredoka-One) font ([OFL 1.1](assets/fonts/OFL.txt)) and six [Tabler Icons](https://tabler.io/icons) ([MIT](assets/icons/LICENSE-tabler)). Contributions are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 

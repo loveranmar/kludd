@@ -143,6 +143,8 @@ window.kludd {
 .empty { font-size: 13px; opacity: 0.6; margin-top: 24px; }
 /* room under the last card so it never touches the status bar */
 .grid { margin-bottom: 12px; }
+/* added folders: rows of their own above the notes, one gap apart */
+.folders { margin-bottom: 8px; }
 
 /* editor view */
 .editor-view { padding: 20px 24px 0 24px; }
@@ -217,6 +219,11 @@ popover.toolbar button:hover { background-color: alpha(@paper, 0.15); }
 popover.toolbar button.on { background-color: alpha(@paper, 0.25); }
 popover.toolbar button.on:hover { background-color: alpha(@paper, 0.32); }
 popover.toolbar .b { font-weight: 500; }
+/* card menu: a folder's colours, above "Remove from Kludd"; round, and
+   kept in their colour when hovered, unlike the menu's other buttons */
+popover.toolbar .tints { margin: 6px 4px 8px 4px; }
+popover.toolbar button.swatch { padding: 0; border-radius: 13px; }
+popover.toolbar button.swatch.tint.none { background-color: @paper; }
 popover.toolbar .i { font-style: italic; }
 popover.toolbar .u label { text-decoration-line: underline; }
 "#;
@@ -229,7 +236,7 @@ pub struct Styles {
 impl Styles {
     pub fn install(display: &gdk::Display, theme: &Theme, zoom: f64) -> Styles {
         let base = gtk::CssProvider::new();
-        base.load_from_string(BASE_CSS);
+        base.load_from_string(&format!("{BASE_CSS}{}", folder_css()));
         gtk::style_context_add_provider_for_display(display, &base, PRIORITY);
         let dynamic = gtk::CssProvider::new();
         gtk::style_context_add_provider_for_display(display, &dynamic, PRIORITY);
@@ -249,6 +256,21 @@ impl Styles {
             15.0 * zoom
         ));
     }
+}
+
+/// A coloured folder card is a theme's accent with that theme's ink on top,
+/// so it reads the same on any paper; the dots in the card menu show it.
+fn folder_css() -> String {
+    THEMES
+        .iter()
+        .map(|t| {
+            format!(
+                ".card.folder.{0} {{ background-color: {1}; color: {2}; }}\n\
+                 popover.toolbar button.swatch.tint.{0} {{ background-color: {1}; }}\n",
+                t.name, t.accent, t.ink
+            )
+        })
+        .collect()
 }
 
 /// Turns off GTK's own right-click menu and emoji picker on a text widget.
@@ -275,6 +297,8 @@ pub const ICON_PLUS: &str = include_str!("../assets/icons/plus.svg");
 pub const ICON_SEARCH: &str = include_str!("../assets/icons/search.svg");
 pub const ICON_ARROW_LEFT: &str = include_str!("../assets/icons/arrow-left.svg");
 pub const ICON_PALETTE: &str = include_str!("../assets/icons/palette.svg");
+pub const ICON_FOLDER: &str = include_str!("../assets/icons/folder.svg");
+pub const ICON_FOLDER_PLUS: &str = include_str!("../assets/icons/folder-plus.svg");
 
 mod imp {
     use super::*;
@@ -365,6 +389,15 @@ mod tests {
         assert_eq!(svg_paths(ICON_SEARCH).count(), 2);
         assert_eq!(svg_paths(ICON_ARROW_LEFT).count(), 3);
         assert_eq!(svg_paths(ICON_PALETTE).count(), 4);
+        assert_eq!(svg_paths(ICON_FOLDER).count(), 1);
+        assert_eq!(svg_paths(ICON_FOLDER_PLUS).count(), 3);
+    }
+
+    #[test]
+    fn folder_colours_follow_the_themes() {
+        let css = folder_css();
+        assert!(css.contains(".card.folder.mint { background-color: #8EDDB5; color: #173A2A; }"));
+        assert_eq!(css.matches(".swatch.tint.").count(), THEMES.len());
     }
 
     #[test]
