@@ -19,6 +19,10 @@ use crate::theme::{self, Styles};
 
 pub const APP_ID: &str = "io.github.loveranmar.Kludd";
 
+/// The widest the status-bar path gets, in characters. Longer paths lose
+/// their beginning, so the file name stays and the clock keeps its room.
+const STATUS_PATH_CHARS: i32 = 28;
+
 /// The application id, which Wayland also uses as the window class.
 /// `KLUDD_APP_ID` overrides it, to test a second copy next to your own.
 pub fn app_id() -> &'static str {
@@ -205,10 +209,10 @@ impl Kludd {
 
         let status_left = gtk::Label::builder()
             .xalign(0.0)
-            .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::Start)
+            .max_width_chars(STATUS_PATH_CHARS)
             .build();
-        let status_right = gtk::Label::builder().xalign(1.0).build();
+        let status_right = gtk::Label::builder().xalign(1.0).hexpand(true).build();
         let statusbar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         statusbar.add_css_class("statusbar");
         statusbar.append(&status_left);
@@ -749,6 +753,7 @@ impl Kludd {
         self.error.replace(Some(message.clone()));
         self.status_left
             .set_ellipsize(gtk::pango::EllipsizeMode::End);
+        self.status_left.set_max_width_chars(-1);
         self.update_status();
         let weak = Rc::downgrade(self);
         glib::timeout_add_seconds_local_once(6, move || {
@@ -764,6 +769,7 @@ impl Kludd {
         self.error.replace(None);
         self.status_left
             .set_ellipsize(gtk::pango::EllipsizeMode::Start);
+        self.status_left.set_max_width_chars(STATUS_PATH_CHARS);
         self.update_status();
     }
 
