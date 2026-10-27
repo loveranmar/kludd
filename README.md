@@ -12,13 +12,14 @@
 
 ## What is Kludd?
 
-Kludd starts once when you log in and waits in the background, so pressing <kbd>Home</kbd> shows it right away: no startup, no loading. You write in rich text (bold, lists, headings) and every note is saved as a plain `.md` file in `~/Kludd`. Markdown that Kludd doesn't understand, like code blocks, tables and links, is kept exactly as you wrote it.
+Kludd starts once when you log in and waits in the background, so pressing <kbd>Home</kbd> shows it right away: no startup, no loading. You write in rich text (bold, lists, headings, code blocks, tables, links) and every note is saved as a plain `.md` file in `~/Kludd`. Markdown that Kludd doesn't draw, like quotes and numbered lists, is kept exactly as you wrote it.
 
 ## Features
 
 - **Instant** — Kludd keeps running in the background; the hotkey just shows its window
 - **Plain files** — one note is one `.md` file named after its title; no database, no index, no frontmatter
 - **Rich text, real Markdown** — bold, italic, underline, bullets and headings while you type, saved as normal Markdown
+- **Code blocks, tables and links** — GitHub-style code blocks, `code` and <kbd>key</kbd> pills; tables that line themselves up as you type; links that read as their text and open with <kbd>Ctrl</kbd>+click
 - **Never mangles a note** — anything unsupported is shown as plain text and written back byte for byte (round-trip tested)
 - **Autosave** — 400 ms after you stop typing and whenever Kludd hides, written atomically
 - **Live reload** — edit a note in nvim and Kludd picks up the change
@@ -26,14 +27,14 @@ Kludd starts once when you log in and waits in the background, so pressing <kbd>
 - **Folders** — add any folder, like a project's `docs/notes`, and its notes get a view of their own; new notes can start right there
 - **Plain text stays plain** — a `.txt` file shows exactly what it holds: no formatting, saved exactly as typed
 - **Six themes** — pink, yellow, mint, lavender, sky and dark, switched live from the palette button
-- **Big notes stay smooth** — in the test suite a 5 000-line note loads in about 50 ms and a keystroke costs about 0.1 ms
+- **Big notes stay smooth** — in the test suite a 5 000-line note full of links and code loads in about 70 ms and a keystroke costs about 0.1 ms
 
 ## Install
 
 ### From source
 
 ```bash
-# GTK 4, the status-bar font and a Rust toolchain (rustup works too)
+# GTK 4, the code font and a Rust toolchain (rustup works too)
 sudo pacman -S --needed gtk4 ttf-jetbrains-mono rust
 
 git clone https://github.com/loveranmar/kludd.git
@@ -90,12 +91,14 @@ To open `.md` and `.txt` files with Kludd by default, run `xdg-mime default klud
 | <kbd>Ctrl</kbd>+<kbd>1</kbd> / <kbd>2</kbd> | Heading 1 / heading 2 |
 | <kbd>Ctrl</kbd>+<kbd>0</kbd> | Normal text |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>8</kbd> | Bullet list |
-| <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Indent / outdent a bullet |
+| <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Indent / outdent a bullet; in a table, next / previous cell |
+| <kbd>Enter</kbd> in a table | New row (on an empty last row: leave the table) |
+| <kbd>Ctrl</kbd>+click | Open a link |
 | <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>-</kbd> | Zoom the editor in / out |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>0</kbd> | Reset zoom |
 | <kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> | Undo / redo (formatting included) |
 
-Typing `- ` or `* ` at the start of a line makes a bullet, `# ` and `## ` make headings, and Enter on an empty bullet ends the list. Select text to get the floating **B** *I* <u>U</u> • H1 H2 toolbar.
+Typing `- ` or `* ` at the start of a line makes a bullet, `# ` and `## ` make headings, and Enter on an empty bullet ends the list. Select text to get the floating **B** *I* <u>U</u> • H1 H2 toolbar. ```` ``` ```` (or ```` ```rust ````) and <kbd>Enter</kbd> starts a code block, and a `| a | b |` line with a `|---|---|` line under it and <kbd>Enter</kbd> starts a table; see [Code blocks, tables and links](#code-blocks-tables-and-links).
 
 From a terminal, `kludd` shows the running Kludd, `kludd file.md` opens a file in it, `kludd ~/code/app/notes` adds that folder and shows its notes, `kludd --toggle` shows or hides it, and `kludd --quit` saves and quits.
 
@@ -124,10 +127,23 @@ Every note is a single Markdown file in `notes_dir`, and nothing else is written
 | <u>Underline</u> | `<u>text</u>` |
 | Bullet | `- text`, two spaces per level |
 | Heading 1 / 2 | `# ` / `## ` |
+| `Code` / <kbd>Key</kbd> | `` `code` `` / `<kbd>Key</kbd>` |
+| Code block | ```` ``` ```` fences around the code |
+| Link | `[text](https://…)`, or the address on its own |
+| Table | `\| a \| b \|` rows, `\|---\|---\|` under the head |
 
 `.txt` files in `notes_dir` show up in the notes too, named after the file. They are plain text: `# ` and `**` are just characters, the formatting shortcuts and toolbar are off, and the file is never renamed.
 
 Files opened from elsewhere are edited where they are and are never renamed. Anything that is not a `.md` (or `.markdown`) file is opened as plain text. Deleting a note (right-click its card) moves it to the trash.
+
+## Code blocks, tables and links
+
+Kludd draws these the way GitHub shows them, but underneath they stay ordinary Markdown: opening and saving a note never changes them.
+
+- **Code blocks** get a box in JetBrains Mono. The ```` ``` ```` fences hide until the cursor is in the block. Typing ```` ``` ```` (or ```` ```rust ````) and pressing <kbd>Enter</kbd> starts one, already closed, and <kbd>Enter</kbd> inside keeps the line's indentation. What you type or paste in a code block is kept as written: `**` stays two stars, and the format toolbar stays away.
+- **`Code`** and **<kbd>keys</kbd>** (`<kbd>Ctrl</kbd>`) get pills; their backticks and tags show only while the cursor is at them.
+- **Tables** get a grid with a shaded head. Typing in a cell lines the columns up again as you go, and <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> move between cells (<kbd>Tab</kbd> in the last cell adds a row). <kbd>Enter</kbd> adds a row; on an empty last row it leaves the table. To start a table, type its head (`| Name | Age |`), then a `|---|---|` line, and press <kbd>Enter</kbd>.
+- **Links** read as their text, underlined; the `[`, `](…)` show while the cursor is at them, and an address written out (`https://…`) is a link too. <kbd>Ctrl</kbd>+click opens a link: a web address in your browser, and a link to a note (`[plan](plan.md)`, next to this one) right in Kludd.
 
 ## Folders
 

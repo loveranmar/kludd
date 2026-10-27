@@ -195,7 +195,7 @@ impl Kludd {
         home.set_folders(config.folders.clone());
         let editor = Editor::new();
         editor.set_zoom(config.zoom);
-        editor.set_accent(theme::by_name(&config.theme).accent_rgba());
+        editor.set_theme(theme::by_name(&config.theme));
         home.set_theme(theme::by_name(&config.theme).name);
 
         let stack = gtk::Stack::builder()
@@ -355,6 +355,12 @@ impl Kludd {
         self.editor.connect_status(move |_| {
             if let Some(k) = weak.upgrade() {
                 k.update_status();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.editor.connect_open_file(move |path| {
+            if let Some(k) = weak.upgrade() {
+                k.open_note(&path);
             }
         });
         let weak = Rc::downgrade(self);
@@ -673,7 +679,7 @@ impl Kludd {
         let mut config = self.config.borrow_mut();
         config.theme = theme.name.to_string();
         self.styles.update(theme, config.zoom);
-        self.editor.set_accent(theme.accent_rgba());
+        self.editor.set_theme(theme);
         self.home.set_theme(theme.name);
         if let Err(e) = config.save() {
             eprintln!("kludd: could not save config: {e}");

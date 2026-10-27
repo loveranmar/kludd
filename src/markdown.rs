@@ -823,6 +823,544 @@ fn needs_escape(c: char, line_start: bool) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// What the editor draws on top of the lines. None of it changes what is
+// saved: code blocks and tables are raw lines, and links and code spans are
+// raw runs inside rich lines.
+
+/// Where a raw line sits in a code block or a table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Block {
+    #[default]
+    None,
+    /// The ``` line that opens a code block.
+    FenceOpen,
+    Code,
+    /// The ``` line that closes it.
+    FenceClose,
+    TableHead,
+    /// The `|---|---|` line under the head.
+    TableRule,
+    TableRow,
+    /// The last row of a table.
+    TableEnd,
+}
+
+impl Block {
+    pub fn is_code(self) -> bool {
+        matches!(self, Block::FenceOpen | Block::Code | Block::FenceClose)
+    }
+
+    pub fn is_table(self) -> bool {
+        matches!(
+            self,
+            Block::TableHead | Block::TableRule | Block::TableRow | Block::TableEnd
+        )
+    }
+}
+
+/// Finds the code blocks and tables. `raw[n]` is the text of line `n` if it
+/// is a raw line: rich lines start no block, though inside a code block
+/// left open they are code, as Markdown has it.
+pub fn blocks(raw: &[Option<&str>]) -> Vec<Block> {
+    let mut out = vec![Block::None; raw.len()];
+    let mut n = 0;
+    while n < raw.len() {
+        let Some(line) = raw[n] else {
+            n += 1;
+            continue;
+        };
+        if let Some(open) = fence(line) {
+            out[n] = Block::FenceOpen;
+            n += 1;
+            while n < raw.len() {
+                let closes = raw[n].is_some_and(|l| closes_fence(l, open));
+                out[n] = if closes {
+                    Block::FenceClose
+                } else {
+                    Block::Code
+                };
+                n += 1;
+                if closes {
+                    break;
+                }
+            }
+            continue;
+        }
+        if let Some(Some(rule)) = raw.get(n + 1)
+            && table_rule(rule)
+            && table_row(line)
+            && table_cells(line).len() == table_cells(rule).len()
+        {
+            out[n] = Block::TableHead;
+            out[n + 1] = Block::TableRule;
+            n += 2;
+            while let Some(Some(row)) = raw.get(n)
+                && table_row(row)
+            {
+                out[n] = Block::TableRow;
+                n += 1;
+            }
+            if out[n - 1] == Block::TableRow {
+                out[n - 1] = Block::TableEnd;
+            }
+            continue;
+        }
+        n += 1;
+    }
+    out
+}
+
+/// An opening code fence: at most three spaces, then three or more
+/// backticks or tildes. Returns the fence character and how many.
+fn fence(line: &str) -> Option<(char, usize)> {
+    let rest = line.trim_start_matches(' ');
+    if line.len() - rest.len() > 3 {
+        return None;
+    }
+    let c = rest.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let len = rest.chars().take_while(|&x| x == c).count();
+    // a backtick fence's info string has no backticks (```x``` is inline code)
+    (len >= 3 && !(c == '`' && rest[len..].contains('`'))).then_some((c, len))
+}
+
+fn closes_fence(line: &str, (c, len): (char, usize)) -> bool {
+    let rest = line.trim_start_matches(' ');
+    let run = rest.chars().take_while(|&x| x == c).count();
+    line.len() - rest.len() <= 3 && run >= len && rest[run..].trim().is_empty()
+}
+
+/// The fence that closes a code block opened by `line`, if `line` opens one.
+pub fn closing_fence(line: &str) -> Option<String> {
+    fence(line).map(|(c, len)| c.to_string().repeat(len))
+}
+
+/// Char offsets of a table row's pipes; `\|` is a pipe inside a cell.
+pub fn table_pipes(line: &str) -> Vec<usize> {
+    let chars: Vec<char> = line.chars().collect();
+    pipes(&chars)
+}
+
+fn pipes(chars: &[char]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            '|' => out.push(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Char ranges of a table row's cells: the text between its pipes. A pipe
+/// at the very start or end starts or ends no cell.
+pub fn table_cells(line: &str) -> Vec<Range<usize>> {
+    let chars: Vec<char> = line.chars().collect();
+    cells(&chars)
+}
+
+fn cells(chars: &[char]) -> Vec<Range<usize>> {
+    let start = chars.iter().take_while(|c| c.is_whitespace()).count();
+    let end = chars.len()
+        - chars[start..]
+            .iter()
+            .rev()
+            .take_while(|c| c.is_whitespace())
+            .count();
+    let mut out = Vec::new();
+    let mut from = start;
+    for p in pipes(chars) {
+        if p != start {
+            out.push(from..p);
+        }
+        from = p + 1;
+    }
+    if from < end {
+        out.push(from..end);
+    }
+    out
+}
+
+/// A line with a pipe in it: a table row, if it follows a table.
+pub fn table_row(line: &str) -> bool {
+    !table_pipes(line).is_empty()
+}
+
+/// The `| --- | :-: |` line under a table's head.
+pub fn table_rule(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    let cells = cells(&chars);
+    !pipes(&chars).is_empty()
+        && !cells.is_empty()
+        && cells.iter().all(|range| {
+            let cell: String = chars[range.clone()].iter().collect();
+            let cell = cell.trim();
+            let dashes = cell.trim_start_matches(':').trim_end_matches(':');
+            !dashes.is_empty() && dashes.chars().all(|c| c == '-') && cell.len() - dashes.len() <= 2
+        })
+}
+
+/// Lines up a table: every row gets every column, each cell padded to its
+/// column's width with a space either side, and pipes at both ends. Row 1
+/// is the rule. `cursor` (row, char offset) comes back as its new offset
+/// in that row, still in the same place of its cell's text. In the cursor's
+/// cell, spaces before the cursor are kept: they may be between two words.
+pub fn format_table(
+    rows: &[String],
+    cursor: Option<(usize, usize)>,
+) -> (Vec<String>, Option<usize>) {
+    let rows: Vec<Vec<char>> = rows.iter().map(|r| r.chars().collect()).collect();
+    let mut cursor_cell = None;
+    let texts: Vec<Vec<String>> = rows
+        .iter()
+        .enumerate()
+        .map(|(r, chars)| {
+            let ranges = cells(chars);
+            ranges
+                .iter()
+                .enumerate()
+                .map(|(c, range)| {
+                    let lead = chars[range.clone()]
+                        .iter()
+                        .take_while(|c| c.is_whitespace())
+                        .count();
+                    let start = range.start + lead;
+                    let trail = chars[start..range.end]
+                        .iter()
+                        .rev()
+                        .take_while(|c| c.is_whitespace())
+                        .count();
+                    let mut end = range.end - trail;
+                    if let Some((row, at)) = cursor
+                        && row == r
+                        && (range.start..=range.end).contains(&at)
+                        && cursor_cell.is_none()
+                    {
+                        end = end.max(at);
+                        cursor_cell = Some((r, c, at.saturating_sub(start).min(end - start)));
+                    }
+                    chars[start..end].iter().collect()
+                })
+                .collect()
+        })
+        .collect();
+
+    let cols = texts.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    let widths: Vec<usize> = (0..cols)
+        .map(|c| {
+            texts
+                .iter()
+                .enumerate()
+                .filter(|(r, _)| *r != 1)
+                .map(|(_, row)| row.get(c).map_or(0, |t| t.chars().count()))
+                .max()
+                .unwrap_or(0)
+                .max(3)
+        })
+        .collect();
+
+    let mut moved = None;
+    let out: Vec<String> = texts
+        .iter()
+        .enumerate()
+        .map(|(r, row)| {
+            let mut line = String::from("|");
+            let mut len = 1;
+            for (c, &width) in widths.iter().enumerate() {
+                let text = row.get(c).map_or("", String::as_str);
+                let cell = if r == 1 {
+                    rule_cell(text, width)
+                } else {
+                    text.to_string()
+                };
+                let n = cell.chars().count();
+                if let Some((cr, cc, offset)) = cursor_cell
+                    && (cr, cc) == (r, c)
+                {
+                    moved = Some(len + 1 + offset.min(n));
+                }
+                line.push(' ');
+                line.push_str(&cell);
+                line.extend(std::iter::repeat_n(' ', width.saturating_sub(n)));
+                line.push_str(" |");
+                len += width.max(n) + 3;
+            }
+            line
+        })
+        .collect();
+
+    // a cursor outside every cell: before the first pipe, or after the last
+    if let Some((row, at)) = cursor
+        && moved.is_none()
+        && let Some(line) = out.get(row)
+    {
+        let first = cells(&rows[row]).first().map_or(0, |r| r.start);
+        moved = Some(if at < first { 0 } else { line.chars().count() });
+    }
+    (out, moved)
+}
+
+fn rule_cell(text: &str, width: usize) -> String {
+    let left = text.starts_with(':');
+    let right = text.len() > 1 && text.ends_with(':');
+    let dashes = width - left as usize - right as usize;
+    format!(
+        "{}{}{}",
+        if left { ":" } else { "" },
+        "-".repeat(dashes),
+        if right { ":" } else { "" }
+    )
+}
+
+/// The cell after (or before) the one at `offset` in `row`, skipping the
+/// rule: where its text ends, as (row, char offset). `None` past either end.
+pub fn table_step(
+    rows: &[String],
+    row: usize,
+    offset: usize,
+    back: bool,
+) -> Option<(usize, usize)> {
+    let mut all = Vec::new();
+    for (r, line) in rows.iter().enumerate() {
+        if r == 1 {
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        for range in cells(&chars) {
+            let trail = chars[range.clone()]
+                .iter()
+                .rev()
+                .take_while(|c| c.is_whitespace())
+                .count();
+            let end = range.end - trail;
+            // an empty cell: just inside it, after its first space
+            let end = if end == range.start {
+                (range.start + 1).min(range.end)
+            } else {
+                end
+            };
+            all.push((r, range, end));
+        }
+    }
+    let in_row = |r: usize| all.iter().filter(move |(cr, ..)| *cr == r);
+    let here = if row == 1 {
+        // the rule: between the head and the first row
+        in_row(0).count().checked_sub(1)?
+    } else {
+        let mine: Vec<usize> = (0..all.len()).filter(|&i| all[i].0 == row).collect();
+        *mine
+            .iter()
+            .find(|&&i| all[i].1.start <= offset && offset <= all[i].1.end)
+            .or_else(|| mine.iter().find(|&&i| offset < all[i].1.start))
+            .or(mine.last())?
+    };
+    let next = if back { here.checked_sub(1)? } else { here + 1 };
+    all.get(next).map(|(r, _, end)| (*r, *end))
+}
+
+/// What a link, bare URL, code span or `<kbd>` key is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineKind {
+    Link,
+    Url,
+    Code,
+    Kbd,
+}
+
+/// A link, bare URL, code span or `<kbd>` key in a line, in char offsets.
+/// `text` is what reads as its content; the rest of `whole` is syntax.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inline {
+    pub kind: InlineKind,
+    pub whole: Range<usize>,
+    pub text: Range<usize>,
+    /// Where a link goes; empty for code and keys.
+    pub url: String,
+}
+
+/// Finds the links, bare URLs, code spans and `<kbd>` keys of a line. Only
+/// raw runs are Markdown (text typed in Kludd is literal), but a bare URL
+/// reads as a link wherever it is.
+pub fn inlines(spans: &[Span]) -> Vec<Inline> {
+    let markdown = spans
+        .iter()
+        .any(|s| s.style.has(Style::RAW) && !s.text.trim().is_empty());
+    if !markdown && !spans.iter().any(|s| s.text.contains("://")) {
+        return Vec::new();
+    }
+    let chars: Vec<(char, bool)> = spans
+        .iter()
+        .flat_map(|s| {
+            let raw = s.style.has(Style::RAW);
+            s.text.chars().map(move |c| (c, raw))
+        })
+        .collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if !chars[i].1 {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && chars[i].1 {
+            i += 1;
+        }
+        let run: String = chars[start..i].iter().map(|(c, _)| c).collect();
+        raw_inlines(&run, start, &mut out);
+    }
+    kbd_keys(&chars, &mut out);
+    bare_urls(&chars, &mut out);
+    out.sort_by_key(|i| i.whole.start);
+    out
+}
+
+/// Links and code spans in a run of Markdown source starting at char `base`.
+fn raw_inlines(run: &str, base: usize, out: &mut Vec<Inline>) {
+    let lead = run.len() - run.trim_start().len();
+    let src = &run[lead..];
+    let at = |byte: usize| base + run[..lead + byte].chars().count();
+    // open links: whole source, destination, extent of the text inside
+    let mut links: Vec<(Range<usize>, String, Option<Range<usize>>)> = Vec::new();
+    let mut images = 0;
+    for (event, range) in Parser::new_ext(src, options()).into_offset_iter() {
+        match &event {
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            }) if images == 0 => {
+                let url = if *link_type == pulldown_cmark::LinkType::Email {
+                    format!("mailto:{dest_url}")
+                } else {
+                    dest_url.to_string()
+                };
+                links.push((range, url, None));
+                continue;
+            }
+            Event::End(TagEnd::Link) if images == 0 => {
+                if let Some((whole, url, text)) = links.pop() {
+                    let text = text.unwrap_or(whole.start + 1..whole.start + 1);
+                    out.push(Inline {
+                        kind: InlineKind::Link,
+                        whole: at(whole.start)..at(whole.end),
+                        text: at(text.start)..at(text.end),
+                        url,
+                    });
+                }
+                continue;
+            }
+            Event::Start(Tag::Image { .. }) => images += 1,
+            Event::End(TagEnd::Image) => images -= 1,
+            Event::Code(_) if images == 0 => {
+                let ticks = src[range.clone()].chars().take_while(|&c| c == '`').count();
+                out.push(Inline {
+                    kind: InlineKind::Code,
+                    whole: at(range.start)..at(range.end),
+                    text: at(range.start + ticks)..at(range.end - ticks),
+                    url: String::new(),
+                });
+            }
+            _ => {}
+        }
+        // everything inside a link is its text
+        if let Some((_, _, text)) = links.last_mut() {
+            *text = Some(match text.take() {
+                Some(t) => t.start.min(range.start)..t.end.max(range.end),
+                None => range,
+            });
+        }
+    }
+}
+
+/// `<kbd>key</kbd>`, with the tags written as Markdown (raw).
+fn kbd_keys(chars: &[(char, bool)], out: &mut Vec<Inline>) {
+    let lower: Vec<char> = chars.iter().map(|(c, _)| c.to_ascii_lowercase()).collect();
+    let raw_at = |i: usize, tag: &str| {
+        let n = tag.chars().count();
+        i + n <= chars.len()
+            && lower[i..i + n].iter().copied().eq(tag.chars())
+            && chars[i..i + n].iter().all(|(_, raw)| *raw)
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        if !raw_at(i, "<kbd>") {
+            i += 1;
+            continue;
+        }
+        let text = i + 5;
+        let close = (text..chars.len()).find(|&j| chars[j].0 == '<');
+        match close {
+            Some(j) if j > text && raw_at(j, "</kbd>") => {
+                out.push(Inline {
+                    kind: InlineKind::Kbd,
+                    whole: i..j + 6,
+                    text: text..j,
+                    url: String::new(),
+                });
+                i = j + 6;
+            }
+            _ => i = text,
+        }
+    }
+}
+
+/// `https://…` written out, outside what was found already. Punctuation at
+/// the end (`see https://x.y.`) is not part of it.
+fn bare_urls(chars: &[(char, bool)], out: &mut Vec<Inline>) {
+    let text: Vec<char> = chars.iter().map(|(c, _)| *c).collect();
+    let starts_with = |i: usize, s: &str| {
+        let n = s.chars().count();
+        i + n <= text.len() && text[i..i + n].iter().copied().eq(s.chars())
+    };
+    let taken: Vec<Range<usize>> = out.iter().map(|i| i.whole.clone()).collect();
+    let mut i = 0;
+    while i < text.len() {
+        let scheme = ["https://", "http://"]
+            .into_iter()
+            .find(|s| starts_with(i, s))
+            .map(|s| s.len());
+        let fresh = i == 0 || !text[i - 1].is_alphanumeric();
+        let Some(scheme) = scheme.filter(|_| fresh && !taken.iter().any(|r| r.contains(&i))) else {
+            i += 1;
+            continue;
+        };
+        let mut end = i;
+        while end < text.len()
+            && !text[end].is_whitespace()
+            && text[end] != '<'
+            && !taken.iter().any(|r| r.contains(&end))
+        {
+            end += 1;
+        }
+        loop {
+            let last = text[end - 1];
+            let unbalanced = last == ')' && {
+                let url = &text[i..end];
+                url.iter().filter(|&&c| c == '(').count()
+                    < url.iter().filter(|&&c| c == ')').count()
+            };
+            if ".,:;!?*_~'\"".contains(last) || unbalanced {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+        if end > i + scheme {
+            out.push(Inline {
+                kind: InlineKind::Url,
+                whole: i..end,
+                text: i..end,
+                url: text[i..end].iter().collect(),
+            });
+        }
+        i = end.max(i + 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers for the note list
 
 /// The note title: text of the first `# ` heading outside code fences.
@@ -1311,5 +1849,171 @@ mod tests {
             Some("Real")
         );
         assert_eq!(title("no heading"), None);
+    }
+
+    fn blocks_of(src: &str) -> Vec<Block> {
+        let lines = parse(src);
+        let texts: Vec<String> = lines.iter().map(Line::text).collect();
+        let raw: Vec<Option<&str>> = lines
+            .iter()
+            .zip(&texts)
+            .map(|(l, t)| (l.kind == LineKind::Raw).then_some(t.as_str()))
+            .collect();
+        blocks(&raw)
+    }
+
+    #[test]
+    fn finds_code_blocks_and_tables() {
+        use Block::*;
+        let src = "Intro\n```rust\nlet a = 1;\n\n~~~\n````\n\n| a | b |\n|---|:-:|\n| 1 | 2 |\n| 3 | 4 |\nafter\n";
+        assert_eq!(
+            blocks_of(src),
+            [
+                None, FenceOpen, Code, Code, Code, FenceClose, None, TableHead, TableRule,
+                TableRow, TableEnd, None
+            ]
+        );
+        // an open block runs to the end; ~~~ is closed only by ~~~
+        assert_eq!(
+            blocks_of("~~~\n```\nx"),
+            [FenceOpen, Code, Code],
+            "unclosed"
+        );
+        // a head without its rule is no table, and ```x``` is inline code
+        assert_eq!(blocks_of("| a | b |\nnext\n"), [None, None]);
+        assert_eq!(blocks_of("```x```\n"), [None]);
+        assert_eq!(closing_fence("````js"), Some("````".into()));
+        assert_eq!(closing_fence("``x`"), Option::None);
+    }
+
+    #[test]
+    fn table_cells_and_rules() {
+        assert_eq!(table_cells("| a | b |"), [1..4, 5..8]);
+        assert_eq!(table_cells("a | b"), [0..2, 3..5]);
+        assert_eq!(table_cells("| a \\| b |").len(), 1);
+        assert_eq!(table_pipes("| a \\| b |"), [0, 9]);
+        assert!(table_rule("|---|:--:|"));
+        assert!(table_rule(" --- | -: "));
+        assert!(!table_rule("| a | - |"));
+        assert!(!table_rule("---"), "a rule needs a pipe");
+        assert!(!table_rule("|::|"));
+    }
+
+    #[test]
+    fn tables_line_up() {
+        let rows: Vec<String> = ["|Name|Age|", "|-|:-:|", "| Ada Lovelace | 36", "|x"]
+            .map(String::from)
+            .to_vec();
+        let (out, _) = format_table(&rows, None);
+        assert_eq!(
+            out,
+            [
+                "| Name         | Age |",
+                "| ------------ | :-: |",
+                "| Ada Lovelace | 36  |",
+                "| x            |     |",
+            ]
+        );
+        // formatting a formatted table changes nothing
+        assert_eq!(format_table(&out, None).0, out);
+
+        // typing in a cell: the cursor stays after what was typed, and a
+        // space typed between words survives
+        let rows: Vec<String> = ["| a   | b   |", "| --- | --- |", "| one  | x   |"]
+            .map(String::from)
+            .to_vec();
+        let (out, at) = format_table(&rows, Some((2, 6)));
+        assert_eq!(out[2], "| one  | x   |");
+        assert_eq!(at, Some(6));
+        let rows: Vec<String> = ["| a   | b   |", "| --- | --- |", "| ones | x   |"]
+            .map(String::from)
+            .to_vec();
+        let (out, at) = format_table(&rows, Some((2, 6)));
+        assert_eq!(out, ["| a    | b   |", "| ---- | --- |", "| ones | x   |"]);
+        assert_eq!(at, Some(6));
+        // a pipe typed in a cell adds a column everywhere
+        let rows: Vec<String> = ["| a | b |", "|---|---|", "| 1 | 2 | 3 |"]
+            .map(String::from)
+            .to_vec();
+        let (out, _) = format_table(&rows, None);
+        assert_eq!(out[0], "| a   | b   |     |");
+        assert_eq!(out[1], "| --- | --- | --- |");
+    }
+
+    #[test]
+    fn tab_walks_the_cells() {
+        let rows: Vec<String> = ["| a   | bb  |", "| --- | --- |", "| 1   |     |"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(table_step(&rows, 0, 3, false), Some((0, 10)));
+        assert_eq!(
+            table_step(&rows, 0, 9, false),
+            Some((2, 3)),
+            "skips the rule"
+        );
+        assert_eq!(
+            table_step(&rows, 2, 3, false),
+            Some((2, 8)),
+            "into an empty cell"
+        );
+        assert_eq!(table_step(&rows, 2, 8, false), None, "past the end");
+        assert_eq!(table_step(&rows, 2, 3, true), Some((0, 10)));
+        assert_eq!(table_step(&rows, 0, 0, true), None);
+        assert_eq!(table_step(&rows, 1, 4, false), Some((2, 3)));
+    }
+
+    fn found(spans: &[Span]) -> Vec<(InlineKind, String, String)> {
+        let text: Vec<char> = spans.iter().flat_map(|s| s.text.chars()).collect();
+        inlines(spans)
+            .into_iter()
+            .map(|i| (i.kind, text[i.text.clone()].iter().collect(), i.url))
+            .collect()
+    }
+
+    #[test]
+    fn finds_links_code_and_keys() {
+        use InlineKind::*;
+        let line = &parse(
+            "See [the docs](https://x.y), `a | b`, <kbd>Ctrl</kbd> and https://kludd.dev/a_(b).\n",
+        )[0];
+        assert_eq!(line.kind, LineKind::Text);
+        assert_eq!(
+            found(&line.spans),
+            [
+                (Link, "the docs".into(), "https://x.y".into()),
+                (Code, "a | b".into(), String::new()),
+                (Kbd, "Ctrl".into(), String::new()),
+                (
+                    Url,
+                    "https://kludd.dev/a_(b)".into(),
+                    "https://kludd.dev/a_(b)".into()
+                ),
+            ]
+        );
+        // where the syntax is: everything around the text
+        let inline = &inlines(&line.spans)[0];
+        assert_eq!((inline.whole.clone(), inline.text.clone()), (4..27, 5..13));
+
+        // text typed in Kludd is literal, except for a bare URL
+        let typed = [Span::new("[x](y) `z` http://a.b", Style::NONE)];
+        assert_eq!(
+            found(&typed),
+            [(Url, "http://a.b".into(), "http://a.b".into())]
+        );
+
+        // raw lines (a table row, a quote) have them too; autolinks and mail
+        let row = &parse("> [**b**](u) <https://a.b> <me@x.y> ``a`b``\n")[0];
+        assert_eq!(row.kind, LineKind::Raw);
+        assert_eq!(
+            found(&row.spans),
+            [
+                (Link, "**b**".into(), "u".into()),
+                (Link, "https://a.b".into(), "https://a.b".into()),
+                (Link, "me@x.y".into(), "mailto:me@x.y".into()),
+                (Code, "a`b".into(), String::new()),
+            ]
+        );
+        // an image is no link
+        assert!(found(&parse("![alt](pic.png)\n")[0].spans).is_empty());
     }
 }

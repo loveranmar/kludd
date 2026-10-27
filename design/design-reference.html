@@ -55,6 +55,21 @@ body{margin:0;padding:40px;background:#f4f2ee;font-family:'Fredoka',sans-serif;d
 .ed ul{margin:4px 0 0;padding-left:20px}
 .tb{position:absolute;top:74px;left:86px;display:flex;gap:2px;background:var(--ink);color:var(--paper);border-radius:10px;padding:4px 6px;font-size:13px}
 .tb span{padding:0 6px}
+
+/* Code, keys, links, code blocks and tables. The editor draws these over the
+   raw Markdown: the syntax (backticks, brackets, fences, pipes) hides while
+   the cursor is away. Code is JetBrains Mono 13px next to 15px text. */
+.ed code,.ed kbd,.ed pre,.ed table{font-family:'JetBrains Mono',monospace}
+.ed code{font-size:13px;padding:2px 4px;border-radius:5px;background:color-mix(in srgb,var(--ink) 8%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--ink) 10%,transparent)}
+.ed kbd{font-size:12px;padding:1px 4px;border-radius:5px;background:color-mix(in srgb,var(--ink) 4%,transparent);border:1px solid color-mix(in srgb,var(--ink) 25%,transparent);border-bottom-width:2px}
+.ed a{color:inherit;text-decoration:underline 2px var(--accent);text-underline-offset:4px}
+.ed pre{margin:6px 0;padding:18px 14px;font-size:13px;line-height:1.43;border-radius:8px;background:color-mix(in srgb,var(--ink) 6%,transparent);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--ink) 10%,transparent)}
+.ed table{margin:8px 0;border-spacing:0;font-size:13px;line-height:1.43;border-radius:6px;overflow:hidden;border:1px solid color-mix(in srgb,var(--ink) 14%,transparent);background:color-mix(in srgb,var(--ink) 2%,transparent)}
+.ed th{font-weight:700;text-align:left;padding:5px 15px 8px;background:color-mix(in srgb,var(--ink) 6%,transparent);border-bottom:1px solid color-mix(in srgb,var(--ink) 14%,transparent)}
+.ed td{padding:3px 15px}
+.ed tr+tr td{border-top:1px solid color-mix(in srgb,var(--ink) 10%,transparent)}
+.ed tr:nth-child(even) td{background:color-mix(in srgb,var(--ink) 2.5%,transparent)}
+.ed th+th,.ed td+td{border-left:1px solid color-mix(in srgb,var(--ink) 14%,transparent)}
 </style>
 </head>
 <body>
@@ -123,6 +138,24 @@ body{margin:0;padding:40px;background:#f4f2ee;font-family:'Fredoka',sans-serif;d
       <div class="sb"><span>~/Kludd/things-to-fix.md</span><span>19:39</span></div>
     </div>
     <div class="cap">Editor view (format toolbar shown over a selection)</div>
+  </div>
+
+  <div>
+    <div class="w ed">
+      <div class="notch"></div>
+      <div class="back"><i class="ti ti-arrow-left" style="font-size:14px;vertical-align:-2px"></i> Notes</div>
+      <h1>Build notes</h1>
+      <div>Run <code>install.sh</code>, see <a href="#">the repo</a>, then <kbd>Ctrl</kbd> + <kbd>N</kbd>.</div>
+      <pre>cargo build --release
+./install.sh</pre>
+      <table>
+        <tr><th>Thing</th><th>When</th></tr>
+        <tr><td>Call dentist</td><td>Friday</td></tr>
+        <tr><td>Buy milk</td><td>today</td></tr>
+      </table>
+      <div class="sb"><span>~/Kludd/build-notes.md</span><span>19:39</span></div>
+    </div>
+    <div class="cap">Editor view: code, keys, a link, a code block and a table (cursor elsewhere, so their Markdown syntax is hidden)</div>
   </div>
 </div>
 

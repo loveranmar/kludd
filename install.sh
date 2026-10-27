@@ -40,7 +40,7 @@ update-desktop-database "$PREFIX/share/applications" >/dev/null 2>&1 || true
 
 echo "Installed $BIN"
 if ! fc-list | grep -q "JetBrains Mono"; then
-    echo "Note: the status bar uses JetBrains Mono: sudo pacman -S ttf-jetbrains-mono"
+    echo "Note: code and the status bar use JetBrains Mono: sudo pacman -S ttf-jetbrains-mono"
 fi
 case ":$PATH:" in
     *":$PREFIX/bin:"*) ;;
