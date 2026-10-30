@@ -12,15 +12,16 @@
 
 ## What is Kludd?
 
-Kludd starts once when you log in and waits in the background, so pressing <kbd>Home</kbd> shows it right away: no startup, no loading. You write in rich text (bold, lists, headings, code blocks, tables, links) and every note is saved as a plain `.md` file in `~/Kludd`. Markdown that Kludd doesn't draw, like quotes and numbered lists, is kept exactly as you wrote it.
+Kludd starts once when you log in and waits in the background, so pressing <kbd>Home</kbd> shows it right away: no startup, no loading. You write in rich text (bold, lists, tasks, quotes, headings, code blocks, tables, links, pictures) and every note is saved as a plain `.md` file in `~/Kludd`. Kludd draws all of Markdown, GitHub's extras included, and anything it draws over is kept exactly as you wrote it.
 
 ## Features
 
 - **Instant** — Kludd keeps running in the background; the hotkey just shows its window
 - **Plain files** — one note is one `.md` file named after its title; no database, no index, no frontmatter
-- **Rich text, real Markdown** — bold, italic, underline, bullets and headings while you type, saved as normal Markdown
+- **Rich text, real Markdown** — bold, italic, underline, strikethrough, bullets, numbered lists, tasks you tick with a click, quotes and six levels of heading while you type, saved as normal Markdown
 - **Code blocks, tables and links** — GitHub-style code blocks, `code` and <kbd>key</kbd> pills; tables that line themselves up as you type; links that read as their text and open with <kbd>Ctrl</kbd>+click
-- **Never mangles a note** — anything unsupported is shown as plain text and written back byte for byte (round-trip tested)
+- **All the rest of Markdown** — pictures, rules, math, footnotes, GitHub's `[!NOTE]` alerts, `==highlights==`, `:emoji:` and inline HTML, drawn the way GitHub shows them
+- **Never mangles a note** — whatever Kludd draws stays ordinary Markdown underneath, written back byte for byte (round-trip tested)
 - **Autosave** — 400 ms after you stop typing and whenever Kludd hides, written atomically
 - **Live reload** — edit a note in nvim and Kludd picks up the change
 - **Any `.md` or `.txt` file** — `kludd notes.md` edits a file in place, and Kludd shows up in "Open with"
@@ -88,10 +89,12 @@ To open `.md` and `.txt` files with Kludd by default, run `xdg-mime default klud
 | <kbd>Ctrl</kbd>+<kbd>F</kbd> | Search notes (or just start typing on the notes view) |
 | <kbd>Esc</kbd> | Back to the notes, out of a folder, or hide Kludd |
 | <kbd>Ctrl</kbd>+<kbd>B</kbd> / <kbd>I</kbd> / <kbd>U</kbd> | Bold / italic / underline |
-| <kbd>Ctrl</kbd>+<kbd>1</kbd> / <kbd>2</kbd> | Heading 1 / heading 2 |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> | Strikethrough |
+| <kbd>Ctrl</kbd>+<kbd>1</kbd> … <kbd>6</kbd> | Heading 1 to 6 |
 | <kbd>Ctrl</kbd>+<kbd>0</kbd> | Normal text |
-| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>8</kbd> | Bullet list |
-| <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Indent / outdent a bullet; in a table, next / previous cell |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>7</kbd> / <kbd>8</kbd> / <kbd>9</kbd> | Numbered list / bullet list / task list |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>.</kbd> | Quote |
+| <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Nest / un-nest a list item; in a table, next / previous cell |
 | <kbd>Enter</kbd> in a table | New row (on an empty last row: leave the table) |
 | <kbd>Ctrl</kbd>+click | Open a link |
 | <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>-</kbd> | Zoom the editor in / out |
@@ -136,14 +139,30 @@ Every note is a single Markdown file in `notes_dir`, and nothing else is written
 
 Files opened from elsewhere are edited where they are and are never renamed. Anything that is not a `.md` (or `.markdown`) file is opened as plain text. Deleting a note (right-click its card) moves it to the trash.
 
-## Code blocks, tables and links
+## Writing
 
-Kludd draws these the way GitHub shows them, but underneath they stay ordinary Markdown: opening and saving a note never changes them.
+Lines start as what their Markdown says, as you type it: `- ` or `* ` a bullet, `1. ` a numbered item, `[ ] ` a task (on a bullet too), `> ` a quote, and `# ` to `###### ` a heading. <kbd>Enter</kbd> carries a list or quote on to the next line (the next number, an open box), and <kbd>Enter</kbd> on an empty item ends it. <kbd>Backspace</kbd> at the start of an item takes it a level out, then back to text.
+
+- **Numbered lists** count the way Markdown does, on from their first number, so `1.` `1.` `1.` reads 1, 2, 3; the numbers line up however many there are. <kbd>Tab</kbd> nests an item under the one before it.
+- **Tasks** get a box; click it to tick the task off (it fades), or click again to bring it back.
+- **Quotes** get a bar down their side, one per level. A quote that starts with `[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]` or `[!CAUTION]` is one of GitHub's alerts: coloured, with its icon and title.
+- **Strikethrough** is `~~text~~`, from the toolbar's **S** or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd>.
+- **A line across**: type `---` (or `***`) and press <kbd>Enter</kbd>. A heading underlined with `===` or `---` reads as one too.
+
+## Code blocks, tables, links and the rest
+
+Kludd draws these the way GitHub shows them, but underneath they stay ordinary Markdown: opening and saving a note never changes them. Their syntax hides while the cursor is away and shows, faintly, when it is there.
 
 - **Code blocks** get a box in JetBrains Mono. The ```` ``` ```` fences hide until the cursor is in the block. Typing ```` ``` ```` (or ```` ```rust ````) and pressing <kbd>Enter</kbd> starts one, already closed, and <kbd>Enter</kbd> inside keeps the line's indentation. What you type or paste in a code block is kept as written: `**` stays two stars, and the format toolbar stays away.
 - **`Code`** and **<kbd>keys</kbd>** (`<kbd>Ctrl</kbd>`) get pills; their backticks and tags show only while the cursor is at them.
 - **Tables** get a grid with a shaded head. Typing in a cell lines the columns up again as you go, and <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> move between cells (<kbd>Tab</kbd> in the last cell adds a row). <kbd>Enter</kbd> adds a row; on an empty last row it leaves the table. To start a table, type its head (`| Name | Age |`), then a `|---|---|` line, and press <kbd>Enter</kbd>.
-- **Links** read as their text, underlined; the `[`, `](…)` show while the cursor is at them, and an address written out (`https://…`) is a link too. <kbd>Ctrl</kbd>+click opens a link: a web address in your browser, and a link to a note (`[plan](plan.md)`, next to this one) right in Kludd.
+- **Links** read as their text, underlined; the `[`, `](…)` show while the cursor is at them, and an address written out (`https://…`) is a link too, as is a reference-style link (`[text][ref]`, with `[ref]: https://…` further down, set small and faint). <kbd>Ctrl</kbd>+click opens a link: a web address in your browser, and a link to a note (`[plan](plan.md)`, next to this one) right in Kludd.
+- **Pictures** (`![alt](shot.png)`, next to the note) show under their line, rounded and sized to fit. Pictures on the web are not fetched: they read as their alt text, a link to them.
+- **Math**, `$x^2$` in a line or `$$` blocks (type `$$` and press <kbd>Enter</kbd>), is set in a serif face, display math centred in a box. The LaTeX itself is shown, not typeset.
+- **Footnotes**: a reference, `[^1]`, is raised and small; <kbd>Ctrl</kbd>+click goes to its text, `[^1]: …`, which is set small like a footnote.
+- **`==Highlights==`** get a stroke of the theme's colour, like a highlighter pen, and **`:emoji:`** codes (GitHub's, `:tada:` gives 🎉) show as the emoji.
+- **Indented code** (four spaces in) gets a code block's box.
+- **HTML**: `<b>`, `<i>`, `<s>`, `<u>`, `<mark>`, `<sup>`, `<sub>`, `<code>`, `<a href>`, `<img src>` and `<summary>` look like what they mean; other tags and `<!-- comments -->` stay, faintly.
 
 ## Folders
 
@@ -153,7 +172,7 @@ Files in an added folder are edited where they are and keep their names, so link
 
 ## License
 
-[MIT](LICENSE): use, change and share Kludd freely; just keep the copyright notice. Kludd bundles the [Fredoka](https://github.com/hafontia/Fredoka-One) font ([OFL 1.1](assets/fonts/OFL.txt)) and six [Tabler Icons](https://tabler.io/icons) ([MIT](assets/icons/LICENSE-tabler)). Contributions are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md).
+[MIT](LICENSE): use, change and share Kludd freely; just keep the copyright notice. Kludd bundles the [Fredoka](https://github.com/hafontia/Fredoka-One) font ([OFL 1.1](assets/fonts/OFL.txt)) thirteen [Tabler Icons](https://tabler.io/icons) ([MIT](assets/icons/LICENSE-tabler)) and GitHub's [emoji shortcodes](https://github.com/github/gemoji) ([MIT](assets/LICENSE-gemoji)). Contributions are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 

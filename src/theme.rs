@@ -226,6 +226,8 @@ popover.toolbar button.swatch { padding: 0; border-radius: 13px; }
 popover.toolbar button.swatch.tint.none { background-color: @paper; }
 popover.toolbar .i { font-style: italic; }
 popover.toolbar .u label { text-decoration-line: underline; }
+popover.toolbar .s label { text-decoration-line: line-through; }
+popover.toolbar button.icon { padding: 0 5px; }
 "#;
 
 /// Owns the CSS providers for one display.
@@ -299,6 +301,14 @@ pub const ICON_ARROW_LEFT: &str = include_str!("../assets/icons/arrow-left.svg")
 pub const ICON_PALETTE: &str = include_str!("../assets/icons/palette.svg");
 pub const ICON_FOLDER: &str = include_str!("../assets/icons/folder.svg");
 pub const ICON_FOLDER_PLUS: &str = include_str!("../assets/icons/folder-plus.svg");
+pub const ICON_TASK: &str = include_str!("../assets/icons/square-check.svg");
+pub const ICON_QUOTE: &str = include_str!("../assets/icons/quote.svg");
+// GitHub's alerts: note, tip, important, warning, caution
+pub const ICON_NOTE: &str = include_str!("../assets/icons/info-circle.svg");
+pub const ICON_TIP: &str = include_str!("../assets/icons/bulb.svg");
+pub const ICON_IMPORTANT: &str = include_str!("../assets/icons/message-report.svg");
+pub const ICON_WARNING: &str = include_str!("../assets/icons/alert-triangle.svg");
+pub const ICON_CAUTION: &str = include_str!("../assets/icons/alert-octagon.svg");
 
 mod imp {
     use super::*;
@@ -352,15 +362,18 @@ impl Icon {
     pub fn new(svg: &str, size: i32) -> Icon {
         let icon: Icon = glib::Object::new();
         icon.imp().size.set(size);
-        icon.imp().paths.replace(
-            svg_paths(svg)
-                .filter_map(|d| gsk::Path::parse(d).ok())
-                .collect(),
-        );
+        icon.imp().paths.replace(icon_paths(svg));
         icon.set_valign(gtk::Align::Center);
         icon.set_halign(gtk::Align::Center);
         icon
     }
+}
+
+/// An icon's strokes, on a 24x24 grid.
+pub fn icon_paths(svg: &str) -> Vec<gsk::Path> {
+    svg_paths(svg)
+        .filter_map(|d| gsk::Path::parse(d).ok())
+        .collect()
 }
 
 /// The `d` attribute of every stroked `<path>` (Tabler adds an invisible
@@ -391,6 +404,17 @@ mod tests {
         assert_eq!(svg_paths(ICON_PALETTE).count(), 4);
         assert_eq!(svg_paths(ICON_FOLDER).count(), 1);
         assert_eq!(svg_paths(ICON_FOLDER_PLUS).count(), 3);
+        for icon in [
+            ICON_TASK,
+            ICON_QUOTE,
+            ICON_NOTE,
+            ICON_TIP,
+            ICON_IMPORTANT,
+            ICON_WARNING,
+            ICON_CAUTION,
+        ] {
+            assert!(!icon_paths(icon).is_empty());
+        }
     }
 
     #[test]

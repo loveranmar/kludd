@@ -1,15 +1,18 @@
 //! Markdown <-> Kludd's line model.
 //!
 //! One editor line is exactly one line of the file. Every line is either
-//! rich (plain text, `# H1`, `## H2` or a `- bullet`, with bold, italic and
-//! underline inside) or raw (kept byte for byte and shown as plain text).
+//! rich (plain text, a `#` heading, a `- bullet`, a `1.` numbered item, a
+//! `- [ ]` task or a `> quote`, with bold, italic, underline and
+//! strikethrough inside) or raw (kept byte for byte and shown as written).
 //!
 //! Round-tripping is guaranteed by construction: a line is only treated as
 //! rich if serializing what was parsed reproduces the original line exactly.
-//! Everything else (code blocks, tables, quotes, numbered lists, links, ...)
-//! stays raw, so opening and saving a file never changes it.
+//! Everything else (code blocks, tables, rules, math, HTML, ...) stays raw,
+//! so opening and saving a file never changes it.
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::OnceLock;
 
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
@@ -30,9 +33,11 @@ impl Style {
     pub const ITALIC_US: Style = Style(32);
     /// Bold written as `__x__` rather than `**x**`.
     pub const BOLD_US: Style = Style(64);
+    /// `~~struck through~~`.
+    pub const STRIKE: Style = Style(128);
 
     /// The bits that change how text looks.
-    pub const MARKUP: Style = Style(1 | 2 | 4);
+    pub const MARKUP: Style = Style(1 | 2 | 4 | 128);
 
     pub fn has(self, other: Style) -> bool {
         self.0 & other.0 == other.0
@@ -53,13 +58,52 @@ pub enum LineKind {
     Text,
     H1,
     H2,
-    /// `indent` leading spaces, then `marker` (`-`, `*` or `+`) and a space.
+    H3,
+    H4,
+    H5,
+    H6,
+    /// `indent` leading spaces, then `marker` (`-`, `*` or `+`) and a space,
+    /// then its box if it is a task.
     Bullet {
         indent: u8,
         marker: u8,
+        task: Option<Task>,
+    },
+    /// `indent` leading spaces, `number`, `delim` (`.` or `)`) and a space,
+    /// then its box if it is a task. `number` is only what is written:
+    /// Markdown counts a list on from its first item, and so does Kludd.
+    Numbered {
+        indent: u8,
+        number: u32,
+        delim: u8,
+        task: Option<Task>,
+    },
+    /// `depth` `>`s; bit `i` of `spaces` is set when the `i`th is followed
+    /// by a space.
+    Quote {
+        depth: u8,
+        spaces: u8,
     },
     /// Unsupported Markdown, kept exactly as written.
     Raw,
+}
+
+/// A task list item's box: `[ ]`, or ticked, `[x]` (or `[X]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Task {
+    Open,
+    /// Ticked, with the letter it was ticked with.
+    Done(u8),
+}
+
+impl Task {
+    fn markdown(task: Option<Task>) -> String {
+        match task {
+            None => String::new(),
+            Some(Task::Open) => "[ ] ".into(),
+            Some(Task::Done(c)) => format!("[{}] ", c as char),
+        }
+    }
 }
 
 impl LineKind {
@@ -67,6 +111,144 @@ impl LineKind {
         LineKind::Bullet {
             indent,
             marker: b'-',
+            task: None,
+        }
+    }
+
+    pub fn numbered(indent: u8, number: u32) -> LineKind {
+        LineKind::Numbered {
+            indent,
+            number,
+            delim: b'.',
+            task: None,
+        }
+    }
+
+    /// A quote `depth` deep, written `> > `.
+    pub fn quote(depth: u8) -> LineKind {
+        LineKind::Quote {
+            depth,
+            spaces: ((1u16 << depth) - 1) as u8,
+        }
+    }
+
+    pub fn heading(level: u8) -> LineKind {
+        match level {
+            1 => LineKind::H1,
+            2 => LineKind::H2,
+            3 => LineKind::H3,
+            4 => LineKind::H4,
+            5 => LineKind::H5,
+            _ => LineKind::H6,
+        }
+    }
+
+    pub fn heading_level(self) -> Option<u8> {
+        match self {
+            LineKind::H1 => Some(1),
+            LineKind::H2 => Some(2),
+            LineKind::H3 => Some(3),
+            LineKind::H4 => Some(4),
+            LineKind::H5 => Some(5),
+            LineKind::H6 => Some(6),
+            _ => None,
+        }
+    }
+
+    pub fn is_list(self) -> bool {
+        matches!(self, LineKind::Bullet { .. } | LineKind::Numbered { .. })
+    }
+
+    pub fn list_indent(self) -> Option<u8> {
+        match self {
+            LineKind::Bullet { indent, .. } | LineKind::Numbered { indent, .. } => Some(indent),
+            _ => None,
+        }
+    }
+
+    /// The same list item at another indent.
+    pub fn with_indent(self, indent: u8) -> LineKind {
+        match self {
+            LineKind::Bullet { marker, task, .. } => LineKind::Bullet {
+                indent,
+                marker,
+                task,
+            },
+            LineKind::Numbered {
+                number,
+                delim,
+                task,
+                ..
+            } => LineKind::Numbered {
+                indent,
+                number,
+                delim,
+                task,
+            },
+            other => other,
+        }
+    }
+
+    /// A list item's box, if it is a task.
+    pub fn task(self) -> Option<Task> {
+        match self {
+            LineKind::Bullet { task, .. } | LineKind::Numbered { task, .. } => task,
+            _ => None,
+        }
+    }
+
+    pub fn with_task(self, task: Option<Task>) -> LineKind {
+        match self {
+            LineKind::Bullet { indent, marker, .. } => LineKind::Bullet {
+                indent,
+                marker,
+                task,
+            },
+            LineKind::Numbered {
+                indent,
+                number,
+                delim,
+                ..
+            } => LineKind::Numbered {
+                indent,
+                number,
+                delim,
+                task,
+            },
+            other => other,
+        }
+    }
+
+    /// Where a list item's text starts in the file: a line indented this
+    /// far is inside the item (a nested item, say).
+    pub fn content_column(self) -> usize {
+        match self {
+            LineKind::Bullet { indent, .. } => indent as usize + 2,
+            LineKind::Numbered { indent, number, .. } => {
+                indent as usize + number.to_string().len() + 2
+            }
+            _ => 0,
+        }
+    }
+
+    /// The kind of a line started under this one with Enter: a list goes on
+    /// (an open box, the next number), a heading is followed by text.
+    pub fn next(self) -> LineKind {
+        match self {
+            LineKind::Numbered {
+                indent,
+                number,
+                delim,
+                task,
+            } => LineKind::Numbered {
+                indent,
+                number: number.saturating_add(1).min(999_999_999),
+                delim,
+                task: task.map(|_| Task::Open),
+            },
+            LineKind::Bullet { task, .. } => self.with_task(task.map(|_| Task::Open)),
+            k if k.heading_level().is_some() => LineKind::Text,
+            other => other,
         }
     }
 }
@@ -119,7 +301,11 @@ impl Line {
 }
 
 fn options() -> Options {
-    Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH
+    Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_MATH
 }
 
 // ---------------------------------------------------------------------------
@@ -179,37 +365,56 @@ pub fn parse(src: &str) -> Vec<Line> {
             .saturating_sub(1)
     };
 
+    // what a top-level block may hold and still be rich lines
+    #[derive(Clone, Copy, PartialEq)]
+    enum Top {
+        /// A paragraph or a one-line `#` heading: inline formatting only.
+        Inline,
+        /// Items of simple lines, nested lists.
+        List,
+        /// Paragraphs and quotes in quotes.
+        Quote,
+    }
     let mut depth = 0usize;
-    let mut block: Option<(Range<usize>, bool)> = None;
+    let mut block: Option<(Range<usize>, Option<Top>)> = None;
     for (event, range) in Parser::new_ext(src, options()).into_offset_iter() {
         match event {
             Event::Start(tag) => {
                 if depth == 0 {
-                    let rich = match &tag {
-                        Tag::Paragraph | Tag::List(None) => true,
-                        Tag::Heading { level, .. } => {
-                            matches!(level, HeadingLevel::H1 | HeadingLevel::H2)
-                                && src[range.clone()].starts_with('#')
-                                && !src[range.clone()].trim_end().contains(['\n', '\r'])
+                    let top = match &tag {
+                        Tag::Paragraph => Some(Top::Inline),
+                        Tag::Heading { .. }
+                            if src[range.clone()].starts_with('#')
+                                && !src[range.clone()].trim_end().contains(['\n', '\r']) =>
+                        {
+                            Some(Top::Inline)
                         }
-                        _ => false,
+                        Tag::List(_) => Some(Top::List),
+                        Tag::BlockQuote(None) => Some(Top::Quote),
+                        _ => None,
                     };
-                    block = Some((range.clone(), rich));
-                } else if let Some((_, rich)) = block.as_mut() {
-                    // Lists are only rich if every item is a simple line.
-                    let simple = matches!(
+                    block = Some((range.clone(), top));
+                } else if let Some((_, top)) = block.as_mut() {
+                    let inline = matches!(
                         tag,
-                        Tag::Item
-                            | Tag::Paragraph
-                            | Tag::List(None)
-                            | Tag::Emphasis
+                        Tag::Emphasis
                             | Tag::Strong
                             | Tag::Strikethrough
                             | Tag::Link { .. }
                             | Tag::Image { .. }
                     );
+                    let simple = inline
+                        || match top {
+                            Some(Top::List) => {
+                                matches!(tag, Tag::Item | Tag::Paragraph | Tag::List(_))
+                            }
+                            Some(Top::Quote) => {
+                                matches!(tag, Tag::Paragraph | Tag::BlockQuote(None))
+                            }
+                            _ => false,
+                        };
                     if !simple {
-                        *rich = false;
+                        *top = None;
                     }
                 }
                 depth += 1;
@@ -217,17 +422,18 @@ pub fn parse(src: &str) -> Vec<Line> {
             Event::End(_) => {
                 depth = depth.saturating_sub(1);
                 if depth == 0
-                    && let Some((range, rich)) = block.take()
+                    && let Some((range, top)) = block.take()
                 {
-                    mark(&mut class, &line_of, range, rich);
+                    mark(&mut class, &line_of, range, top.is_some());
                 }
             }
             Event::Rule | Event::DisplayMath(_) | Event::Html(_) if depth == 0 => {
                 mark(&mut class, &line_of, range, false);
             }
-            Event::TaskListMarker(_) => {
-                if let Some((_, rich)) = block.as_mut() {
-                    *rich = false;
+            // display math in a paragraph spans lines of its own
+            Event::DisplayMath(_) => {
+                if let Some((_, top)) = block.as_mut() {
+                    *top = None;
                 }
             }
             _ => {}
@@ -305,28 +511,67 @@ pub fn parse_plain(src: &str) -> Vec<Line> {
         .collect()
 }
 
-/// Recognises the line prefix: `# `, `## `, `<indent>- ` or nothing.
+/// Recognises the line prefix: `#` to `######`, `>`s, a bullet or a
+/// number (and a task box after either), or nothing.
 fn line_prefix(content: &str) -> (LineKind, usize) {
-    if content.starts_with("# ") {
-        return (LineKind::H1, 2);
+    let bytes = content.as_bytes();
+    let hashes = bytes.iter().take_while(|&&b| b == b'#').count();
+    if (1..=6).contains(&hashes) && bytes.get(hashes) == Some(&b' ') {
+        return (LineKind::heading(hashes as u8), hashes + 1);
     }
-    if content.starts_with("## ") {
-        return (LineKind::H2, 3);
+    if content.starts_with('>') {
+        let (mut i, mut depth, mut spaces) = (0, 0u8, 0u8);
+        while bytes.get(i) == Some(&b'>') && depth < 8 {
+            i += 1;
+            if bytes.get(i) == Some(&b' ') {
+                spaces |= 1 << depth;
+                i += 1;
+            }
+            depth += 1;
+        }
+        return (LineKind::Quote { depth, spaces }, i);
     }
     let indent = content.len() - content.trim_start_matches(' ').len();
-    let rest = &content.as_bytes()[indent..];
-    if indent <= u8::MAX as usize
-        && rest.len() >= 2
-        && matches!(rest[0], b'-' | b'*' | b'+')
-        && rest[1] == b' '
-    {
+    if indent > u8::MAX as usize {
+        return (LineKind::Text, 0);
+    }
+    let rest = &bytes[indent..];
+    if rest.len() >= 2 && matches!(rest[0], b'-' | b'*' | b'+') && rest[1] == b' ' {
+        let (task, len) = task_box(&rest[2..]);
         let kind = LineKind::Bullet {
             indent: indent as u8,
             marker: rest[0],
+            task,
         };
-        return (kind, indent + 2);
+        return (kind, indent + 2 + len);
+    }
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    // a leading zero would be lost: such items stay as written
+    if (1..=9).contains(&digits)
+        && !(rest[0] == b'0' && digits > 1)
+        && matches!(rest.get(digits), Some(b'.' | b')'))
+        && rest.get(digits + 1) == Some(&b' ')
+    {
+        let number = content[indent..indent + digits].parse().unwrap_or(0);
+        let (task, len) = task_box(&rest[digits + 2..]);
+        let kind = LineKind::Numbered {
+            indent: indent as u8,
+            number,
+            delim: rest[digits],
+            task,
+        };
+        return (kind, indent + digits + 2 + len);
     }
     (LineKind::Text, 0)
+}
+
+/// `[ ] `, `[x] ` or `[X] ` after a list marker.
+fn task_box(rest: &[u8]) -> (Option<Task>, usize) {
+    match rest {
+        [b'[', b' ', b']', b' ', ..] => (Some(Task::Open), 4),
+        [b'[', c @ (b'x' | b'X'), b']', b' ', ..] => (Some(Task::Done(*c)), 4),
+        _ => (None, 0),
+    }
 }
 
 /// Parses one line on its own. Returns `None` if it isn't a single rich line.
@@ -347,11 +592,15 @@ pub fn parse_line(content: &str) -> Option<(LineKind, Vec<Span>)> {
         spans.push(Span::new(lead, Style::RAW));
     }
     if !core.is_empty() {
+        // the prefix in its plainest form: only its structure matters here
         let shown_prefix = match kind {
-            LineKind::H1 => "# ",
-            LineKind::H2 => "## ",
-            LineKind::Bullet { .. } => "- ",
-            _ => "",
+            LineKind::Bullet { task, .. } => format!("- {}", Task::markdown(task)),
+            LineKind::Numbered { task, .. } => format!("1. {}", Task::markdown(task)),
+            LineKind::Quote { depth, .. } => "> ".repeat(depth as usize),
+            k => match k.heading_level() {
+                Some(level) => format!("{} ", "#".repeat(level as usize)),
+                None => String::new(),
+            },
         };
         let source = format!("{shown_prefix}{core}");
         spans.extend(parse_inline(&source, shown_prefix.len(), kind)?);
@@ -362,42 +611,78 @@ pub fn parse_line(content: &str) -> Option<(LineKind, Vec<Span>)> {
     Some((kind, merge(spans)))
 }
 
+/// What a line's prefix opens, in the order the parser reports it.
+#[derive(Clone, Copy)]
+enum Opening {
+    Heading(HeadingLevel),
+    Bullets,
+    Numbers,
+    Item,
+    /// A task box, ticked or not (an event, not a tag: nothing closes it).
+    Task(bool),
+    Quote,
+    Paragraph,
+}
+
+impl Opening {
+    fn matches(self, event: &Event) -> bool {
+        match (self, event) {
+            (Opening::Heading(want), Event::Start(Tag::Heading { level, .. })) => *level == want,
+            (Opening::Bullets, Event::Start(Tag::List(None))) => true,
+            (Opening::Numbers, Event::Start(Tag::List(Some(_)))) => true,
+            (Opening::Item, Event::Start(Tag::Item)) => true,
+            (Opening::Task(want), Event::TaskListMarker(done)) => *done == want,
+            (Opening::Quote, Event::Start(Tag::BlockQuote(None))) => true,
+            (Opening::Paragraph, Event::Start(Tag::Paragraph)) => true,
+            _ => false,
+        }
+    }
+
+    fn of(kind: LineKind) -> Vec<Opening> {
+        let task = |task: Option<Task>| task.map(|t| Opening::Task(t != Task::Open));
+        match kind {
+            LineKind::Bullet { task: t, .. } => {
+                [Some(Opening::Bullets), Some(Opening::Item), task(t)]
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            }
+            LineKind::Numbered { task: t, .. } => {
+                [Some(Opening::Numbers), Some(Opening::Item), task(t)]
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            }
+            LineKind::Quote { depth, .. } => {
+                let mut out = vec![Opening::Quote; depth as usize];
+                out.push(Opening::Paragraph);
+                out
+            }
+            k => match k.heading_level() {
+                Some(level) => vec![Opening::Heading(
+                    HeadingLevel::try_from(level as usize).unwrap_or(HeadingLevel::H6),
+                )],
+                None => vec![Opening::Paragraph],
+            },
+        }
+    }
+}
+
 fn parse_inline(src: &str, offset: usize, kind: LineKind) -> Option<Vec<Span>> {
     let mut events = Parser::new_ext(src, options()).into_offset_iter();
 
     // The block structure must be exactly what the prefix promises.
-    let opening: &[fn(&Event) -> bool] = match kind {
-        LineKind::H1 => &[|e| {
-            matches!(
-                e,
-                Event::Start(Tag::Heading {
-                    level: HeadingLevel::H1,
-                    ..
-                })
-            )
-        }],
-        LineKind::H2 => &[|e| {
-            matches!(
-                e,
-                Event::Start(Tag::Heading {
-                    level: HeadingLevel::H2,
-                    ..
-                })
-            )
-        }],
-        LineKind::Bullet { .. } => &[
-            |e| matches!(e, Event::Start(Tag::List(None))),
-            |e| matches!(e, Event::Start(Tag::Item)),
-        ],
-        _ => &[|e| matches!(e, Event::Start(Tag::Paragraph))],
-    };
-    for check in opening {
+    let opening = Opening::of(kind);
+    for check in &opening {
         let (event, _) = events.next()?;
-        if !check(&event) {
+        if !check.matches(&event) {
             return None;
         }
     }
-    let closing = opening.len();
+    let closing = opening
+        .iter()
+        .filter(|o| !matches!(o, Opening::Task(_)))
+        .count();
 
     let mut spans = Vec::new();
     let mut style = Style::NONE;
@@ -465,7 +750,12 @@ fn parse_inline(src: &str, offset: usize, kind: LineKind) -> Option<Vec<Span>> {
                     style = style.with(Style::ITALIC_US);
                 }
             }
-            Event::End(TagEnd::Strong | TagEnd::Emphasis) => {
+            // `~~x~~`; a single `~x~` is kept as written
+            Event::Start(Tag::Strikethrough) if src[range.start..].starts_with("~~") => {
+                stack.push(style);
+                style = style.with(Style::STRIKE);
+            }
+            Event::End(TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough) => {
                 let underlined = style.has(Style::UNDERLINE);
                 style = stack.pop()?;
                 if underlined {
@@ -550,6 +840,23 @@ pub fn serialize(lines: &[Line]) -> String {
 /// Turns one line back into Markdown. Text is only escaped when it would
 /// otherwise be read back differently.
 pub fn serialize_line(kind: LineKind, spans: &[Span]) -> String {
+    // `>` and then a space typed: the space after `>` is the prefix's, so
+    // the one typed needs another before it
+    let kind = match kind {
+        LineKind::Quote { depth, spaces }
+            if depth > 0
+                && spaces & (1 << (depth - 1)) == 0
+                && spans
+                    .first()
+                    .is_some_and(|s| s.text.starts_with([' ', '\t'])) =>
+        {
+            LineKind::Quote {
+                depth,
+                spaces: spaces | 1 << (depth - 1),
+            }
+        }
+        _ => kind,
+    };
     let plain = render(kind, spans, Mode::PLAIN);
     if kind == LineKind::Raw || !needs_check(spans) {
         return plain;
@@ -575,7 +882,14 @@ pub fn serialize_line(kind: LineKind, spans: &[Span]) -> String {
 
 fn same_kind(a: LineKind, b: LineKind) -> bool {
     match (a, b) {
-        (LineKind::Bullet { indent: x, .. }, LineKind::Bullet { indent: y, .. }) => x == y,
+        (
+            LineKind::Bullet {
+                indent: x, task: s, ..
+            },
+            LineKind::Bullet {
+                indent: y, task: t, ..
+            },
+        ) => x == y && s == t,
         _ => a == b,
     }
 }
@@ -600,7 +914,7 @@ fn normalized(spans: &[Span]) -> Vec<(char, u8)> {
 }
 
 const INLINE_SPECIAL: &[char] = &[
-    '\\', '*', '_', '`', '[', ']', '<', '>', '~', '&', '!', '#', '|',
+    '\\', '*', '_', '`', '[', ']', '<', '>', '~', '&', '!', '#', '|', '$',
 ];
 
 fn needs_check(spans: &[Span]) -> bool {
@@ -629,15 +943,34 @@ fn needs_check(spans: &[Span]) -> bool {
 
 fn prefix(kind: LineKind) -> String {
     match kind {
-        LineKind::H1 => "# ".into(),
-        LineKind::H2 => "## ".into(),
-        LineKind::Bullet { indent, marker } => {
-            let mut s = " ".repeat(indent as usize);
-            s.push(marker as char);
-            s.push(' ');
-            s
-        }
-        LineKind::Text | LineKind::Raw => String::new(),
+        LineKind::Bullet {
+            indent,
+            marker,
+            task,
+        } => format!(
+            "{}{} {}",
+            " ".repeat(indent as usize),
+            marker as char,
+            Task::markdown(task)
+        ),
+        LineKind::Numbered {
+            indent,
+            number,
+            delim,
+            task,
+        } => format!(
+            "{}{number}{} {}",
+            " ".repeat(indent as usize),
+            delim as char,
+            Task::markdown(task)
+        ),
+        LineKind::Quote { depth, spaces } => (0..depth)
+            .map(|i| if spaces & (1 << i) != 0 { "> " } else { ">" })
+            .collect(),
+        k => match k.heading_level() {
+            Some(level) => format!("{} ", "#".repeat(level as usize)),
+            None => String::new(),
+        },
     }
 }
 
@@ -741,14 +1074,16 @@ fn render(kind: LineKind, spans: &[Span], mode: Mode) -> String {
     };
 
     // `1. ` / `1) ` at the start would begin a numbered list: escape the dot
+    // (digits written inside markup, `**1.**`, start no list)
     let indent = chars.iter().take_while(|(c, _)| c.is_whitespace()).count();
-    let digits = chars[indent..]
-        .iter()
-        .take_while(|(c, s)| c.is_ascii_digit() && *s == Style::NONE)
+    let bare = |i: usize| markup[i] == Style::NONE && !chars[i].1.has(Style::RAW);
+    let digits = (indent..chars.len())
+        .take_while(|&i| chars[i].0.is_ascii_digit() && bare(i))
         .count();
     let list_dot = (mode.escape
         && digits > 0
-        && matches!(chars.get(indent + digits), Some(('.' | ')', Style::NONE))))
+        && matches!(chars.get(indent + digits), Some(('.' | ')', _)))
+        && bare(indent + digits))
     .then_some(indent + digits);
 
     let mut open: Vec<(Style, &'static str)> = Vec::new();
@@ -764,13 +1099,14 @@ fn render(kind: LineKind, spans: &[Span], mode: Mode) -> String {
         }
         // open what is missing, longest-lasting first so it nests outermost;
         // never right before whitespace (`** x**` is not bold)
-        let mut missing: Vec<(usize, Style)> = [Style::UNDERLINE, Style::BOLD, Style::ITALIC]
-            .into_iter()
-            .filter(|flag| {
-                !c.is_whitespace() && want.has(*flag) && !open.iter().any(|(f, _)| f == flag)
-            })
-            .map(|flag| (markup[i..].iter().take_while(|m| m.has(flag)).count(), flag))
-            .collect();
+        let mut missing: Vec<(usize, Style)> =
+            [Style::UNDERLINE, Style::BOLD, Style::ITALIC, Style::STRIKE]
+                .into_iter()
+                .filter(|flag| {
+                    !c.is_whitespace() && want.has(*flag) && !open.iter().any(|(f, _)| f == flag)
+                })
+                .map(|flag| (markup[i..].iter().take_while(|m| m.has(flag)).count(), flag))
+                .collect();
         missing.sort_by_key(|&(run, _)| std::cmp::Reverse(run));
         for (_, flag) in missing {
             open_flag(&mut out, &mut open, flag, style, mode);
@@ -800,6 +1136,8 @@ fn open_flag(
 ) {
     let (start, end) = if flag == Style::UNDERLINE {
         ("<u>", "</u>")
+    } else if flag == Style::STRIKE {
+        ("~~", "~~")
     } else if flag == Style::BOLD {
         if style.has(Style::BOLD_US) {
             ("__", "__")
@@ -818,16 +1156,17 @@ fn open_flag(
 fn needs_escape(c: char, line_start: bool) -> bool {
     matches!(
         c,
-        '\\' | '*' | '_' | '`' | '[' | ']' | '<' | '~' | '&' | '!'
+        '\\' | '*' | '_' | '`' | '[' | ']' | '<' | '~' | '&' | '!' | '$'
     ) || (line_start && matches!(c, '#' | '>' | '-' | '+' | '=' | '|'))
 }
 
 // ---------------------------------------------------------------------------
 // What the editor draws on top of the lines. None of it changes what is
-// saved: code blocks and tables are raw lines, and links and code spans are
-// raw runs inside rich lines.
+// saved: code blocks, tables, rules and math are raw lines, and links and
+// code spans are raw runs inside rich lines.
 
-/// Where a raw line sits in a code block or a table.
+/// Where a raw line sits in a block Kludd draws: a code block, a table,
+/// display math, a rule, a heading underlined with `===`, a quote.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Block {
     #[default]
@@ -837,17 +1176,45 @@ pub enum Block {
     Code,
     /// The ``` line that closes it.
     FenceClose,
+    /// Code indented four spaces; the first and last line of its block.
+    Indented {
+        first: bool,
+        last: bool,
+    },
     TableHead,
     /// The `|---|---|` line under the head.
     TableRule,
     TableRow,
     /// The last row of a table.
     TableEnd,
+    /// The `$$` lines around display math, and the math between them.
+    MathOpen,
+    Math,
+    MathClose,
+    /// `$$ x $$` on a line of its own.
+    MathLine,
+    /// A paragraph line with a `===` (level 1) or `---` (level 2) line
+    /// under it: a heading.
+    SetextText {
+        level: u8,
+    },
+    SetextRule {
+        level: u8,
+    },
+    /// `---`, `***` or `___`: a line across.
+    Rule,
+    /// A quote kept as written (`> - a list in it`, say), `depth` deep.
+    Quote {
+        depth: u8,
+    },
 }
 
 impl Block {
     pub fn is_code(self) -> bool {
-        matches!(self, Block::FenceOpen | Block::Code | Block::FenceClose)
+        matches!(
+            self,
+            Block::FenceOpen | Block::Code | Block::FenceClose | Block::Indented { .. }
+        )
     }
 
     pub fn is_table(self) -> bool {
@@ -856,24 +1223,83 @@ impl Block {
             Block::TableHead | Block::TableRule | Block::TableRow | Block::TableEnd
         )
     }
+
+    pub fn is_math(self) -> bool {
+        matches!(
+            self,
+            Block::MathOpen | Block::Math | Block::MathClose | Block::MathLine
+        )
+    }
+
+    /// In a box: code, tables and display math.
+    pub fn is_boxed(self) -> bool {
+        self.is_code() || self.is_table() || self.is_math()
+    }
+
+    /// Lines drawn as a block of their own, kept as written.
+    pub fn is_opaque(self) -> bool {
+        matches!(
+            self,
+            Block::FenceOpen
+                | Block::Code
+                | Block::FenceClose
+                | Block::Indented { .. }
+                | Block::MathOpen
+                | Block::Math
+                | Block::MathClose
+                | Block::MathLine
+                | Block::TableRule
+                | Block::SetextRule { .. }
+                | Block::Rule
+        )
+    }
 }
 
-/// Finds the code blocks and tables. `raw[n]` is the text of line `n` if it
-/// is a raw line: rich lines start no block, though inside a code block
-/// left open they are code, as Markdown has it.
-pub fn blocks(raw: &[Option<&str>]) -> Vec<Block> {
-    let mut out = vec![Block::None; raw.len()];
+/// `next` goes on the block `prev` is in.
+pub fn continues(prev: Block, next: Block) -> bool {
+    use Block::*;
+    matches!(
+        (prev, next),
+        (FenceOpen | Code, Code | FenceClose)
+            | (Indented { last: false, .. }, Indented { .. })
+            | (MathOpen | Math, Math | MathClose)
+            | (SetextText { .. }, SetextRule { .. })
+            | (TableHead, TableRule)
+            | (TableRule | TableRow, TableRow | TableEnd)
+    )
+}
+
+/// Finds the blocks among the lines, given as (kind, text). Only raw lines
+/// start blocks, though inside a code block left open rich lines are code,
+/// as Markdown has it, and a rich line can be a heading's text.
+pub fn blocks(lines: &[(LineKind, &str)]) -> Vec<Block> {
+    let raw = |n: usize| {
+        lines
+            .get(n)
+            .and_then(|&(kind, text)| (kind == LineKind::Raw).then_some(text))
+    };
+    let blank = |n: usize| lines.get(n).is_none_or(|(_, text)| text.trim().is_empty());
+    let mut out = vec![Block::None; lines.len()];
     let mut n = 0;
-    while n < raw.len() {
-        let Some(line) = raw[n] else {
+    while n < lines.len() {
+        // a paragraph line underlined with === or ---
+        if let Some(level) = raw(n + 1).and_then(setext_underline)
+            && paragraph(lines[n])
+        {
+            out[n] = Block::SetextText { level };
+            out[n + 1] = Block::SetextRule { level };
+            n += 2;
+            continue;
+        }
+        let Some(line) = raw(n) else {
             n += 1;
             continue;
         };
         if let Some(open) = fence(line) {
             out[n] = Block::FenceOpen;
             n += 1;
-            while n < raw.len() {
-                let closes = raw[n].is_some_and(|l| closes_fence(l, open));
+            while n < lines.len() {
+                let closes = raw(n).is_some_and(|l| closes_fence(l, open));
                 out[n] = if closes {
                     Block::FenceClose
                 } else {
@@ -886,7 +1312,19 @@ pub fn blocks(raw: &[Option<&str>]) -> Vec<Block> {
             }
             continue;
         }
-        if let Some(Some(rule)) = raw.get(n + 1)
+        // $$ ... $$ (one left open is just text until it is closed)
+        if math_fence(line)
+            && let Some(close) = (n + 1..lines.len())
+                .take_while(|&m| raw(m).is_some())
+                .find(|&m| raw(m).is_some_and(math_fence))
+        {
+            out[n] = Block::MathOpen;
+            out[n + 1..close].fill(Block::Math);
+            out[close] = Block::MathClose;
+            n = close + 1;
+            continue;
+        }
+        if let Some(rule) = raw(n + 1)
             && table_rule(rule)
             && table_row(line)
             && table_cells(line).len() == table_cells(rule).len()
@@ -894,7 +1332,7 @@ pub fn blocks(raw: &[Option<&str>]) -> Vec<Block> {
             out[n] = Block::TableHead;
             out[n + 1] = Block::TableRule;
             n += 2;
-            while let Some(Some(row)) = raw.get(n)
+            while let Some(row) = raw(n)
                 && table_row(row)
             {
                 out[n] = Block::TableRow;
@@ -905,7 +1343,302 @@ pub fn blocks(raw: &[Option<&str>]) -> Vec<Block> {
             }
             continue;
         }
+        // four spaces in, after a blank line (not in a list item: there it
+        // is the item's text)
+        let after_list = || {
+            (0..n)
+                .rev()
+                .find(|&m| !blank(m))
+                .is_some_and(|m| lines[m].0.is_list())
+        };
+        if indented(line) && (n == 0 || blank(n - 1)) && !after_list() {
+            let mut end = n;
+            while raw(end).is_some_and(|l| indented(l) || l.trim().is_empty()) {
+                end += 1;
+            }
+            while end > n + 1 && blank(end - 1) {
+                end -= 1;
+            }
+            for (m, block) in out.iter_mut().enumerate().take(end).skip(n) {
+                *block = Block::Indented {
+                    first: m == n,
+                    last: m + 1 == end,
+                };
+            }
+            n = end;
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.len() > 4 && trimmed.starts_with("$$") && trimmed.ends_with("$$") {
+            out[n] = Block::MathLine;
+        } else if thematic_break(line) {
+            out[n] = Block::Rule;
+        } else if let Some(depth) = quote_depth(line) {
+            out[n] = Block::Quote { depth };
+        }
         n += 1;
+    }
+    out
+}
+
+/// Where Tab and Shift+Tab move list item `n`: the indent that puts it
+/// inside the item before it at its level (`None` if there is none), and
+/// the indent that takes it out a level (`None` at the top already).
+pub fn list_moves(kinds: &[LineKind], n: usize) -> (Option<u8>, Option<u8>) {
+    let Some(indent) = kinds.get(n).and_then(|k| k.list_indent()) else {
+        return (None, None);
+    };
+    let mut start = n;
+    while start > 0 && kinds[start - 1].is_list() {
+        start -= 1;
+    }
+    // the items open above, as (indent, where their text starts)
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    for kind in &kinds[start..n] {
+        let i = kind.list_indent().unwrap_or(0) as usize;
+        while open.last().is_some_and(|o| i < o.1) {
+            open.pop();
+        }
+        open.push((i, kind.content_column()));
+    }
+    let indent = indent as usize;
+    let mut sibling = None;
+    while open.last().is_some_and(|o| indent < o.1) {
+        sibling = open.pop();
+    }
+    let inside = sibling.map(|(_, col)| col.min(u8::MAX as usize) as u8);
+    let out = match open.last() {
+        Some(&(parent, _)) => Some(parent as u8),
+        None => (indent > 0).then_some(0),
+    };
+    (inside, out)
+}
+
+/// Up to three spaces in, as block syntax may be.
+fn unindent(line: &str) -> Option<&str> {
+    let rest = line.trim_start_matches(' ');
+    (line.len() - rest.len() <= 3).then_some(rest)
+}
+
+/// `===` (level 1) or `---` (level 2) under a paragraph line.
+fn setext_underline(line: &str) -> Option<u8> {
+    let rest = unindent(line)?.trim_end();
+    let c = rest.chars().next()?;
+    (matches!(c, '=' | '-') && rest.chars().all(|x| x == c)).then_some(if c == '=' { 1 } else { 2 })
+}
+
+/// A line that can be a paragraph's: text, or raw text that starts no
+/// other block.
+fn paragraph((kind, text): (LineKind, &str)) -> bool {
+    if text.trim().is_empty() {
+        return false;
+    }
+    match kind {
+        LineKind::Text => true,
+        LineKind::Raw => unindent(text).is_some_and(|rest| {
+            !rest.starts_with(['>', '#', '<', '|', '`', '~', '$'])
+                && !thematic_break(text)
+                && line_prefix(text).0 == LineKind::Text
+        }),
+        _ => false,
+    }
+}
+
+/// `---`, `***`, `___` (spaces between allowed), three or more.
+fn thematic_break(line: &str) -> bool {
+    let Some(rest) = unindent(line) else {
+        return false;
+    };
+    let Some(c) = rest.chars().next().filter(|c| matches!(c, '-' | '*' | '_')) else {
+        return false;
+    };
+    rest.chars().all(|x| x == c || x == ' ' || x == '\t') && rest.matches(c).count() >= 3
+}
+
+fn math_fence(line: &str) -> bool {
+    unindent(line).is_some_and(|rest| rest.trim_end() == "$$")
+}
+
+fn indented(line: &str) -> bool {
+    (line.starts_with("    ") || line.starts_with('\t')) && !line.trim().is_empty()
+}
+
+/// How many `>`s a quote line starts with.
+fn quote_depth(line: &str) -> Option<u8> {
+    let mut rest = unindent(line)?;
+    let mut depth = 0u8;
+    while let Some(after) = rest.strip_prefix('>') {
+        depth = depth.saturating_add(1);
+        rest = after.strip_prefix(' ').unwrap_or(after);
+    }
+    (depth > 0).then_some(depth)
+}
+
+/// Where a quote line's text starts, after its `>`s.
+pub fn quote_text(line: &str) -> usize {
+    let Some(mut rest) = unindent(line) else {
+        return 0;
+    };
+    while let Some(after) = rest.strip_prefix('>') {
+        rest = after.strip_prefix(' ').unwrap_or(after);
+    }
+    line.len() - rest.len()
+}
+
+/// The leading spaces or tab that make a line indented code.
+pub fn code_indent(line: &str) -> usize {
+    if line.starts_with('\t') { 1 } else { 4 }
+}
+
+/// GitHub's alerts: a quote starting with `[!NOTE]` and the like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Alert {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
+}
+
+impl Alert {
+    /// `[!NOTE]` (any case), alone on the line.
+    pub fn parse(text: &str) -> Option<Alert> {
+        let name = text.trim().strip_prefix("[!")?.strip_suffix(']')?;
+        Some(match name.to_ascii_uppercase().as_str() {
+            "NOTE" => Alert::Note,
+            "TIP" => Alert::Tip,
+            "IMPORTANT" => Alert::Important,
+            "WARNING" => Alert::Warning,
+            "CAUTION" => Alert::Caution,
+            _ => return None,
+        })
+    }
+}
+
+/// What a line looks like beyond its kind and block, worked out from the
+/// lines around it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Shape {
+    /// How deep a list item is nested.
+    pub level: u8,
+    /// The number a numbered item shows, and the digits of the widest
+    /// number in its list (they all line up after it).
+    pub number: u32,
+    pub digits: u8,
+    /// The first and last line of a quote.
+    pub quote_first: bool,
+    pub quote_last: bool,
+    /// The alert a quote is.
+    pub alert: Option<Alert>,
+}
+
+/// Works out the shapes. `text(n)` is line `n`'s text; it is only asked for
+/// lines that are neither list items nor quotes, inside a list, and for
+/// the first line of a quote.
+pub fn shapes(kinds: &[LineKind], blocks: &[Block], text: impl Fn(usize) -> String) -> Vec<Shape> {
+    let mut out = vec![Shape::default(); kinds.len()];
+
+    // lists nest by indentation, as Markdown reads it: an item indented as
+    // far as its parent's text is inside it
+    struct Open {
+        col: usize,
+        list: usize,
+        /// Delimiter and number shown, for a numbered item.
+        number: Option<(u8, u32)>,
+    }
+    let mut stack: Vec<Open> = Vec::new();
+    let mut digits: Vec<u8> = Vec::new();
+    let mut list_of = vec![None; kinds.len()];
+    for (n, &kind) in kinds.iter().enumerate() {
+        let Some(indent) = kind.list_indent() else {
+            if stack.is_empty() {
+                continue;
+            }
+            if matches!(kind, LineKind::Text | LineKind::Raw) {
+                let line = text(n);
+                // a blank line keeps a list going
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let lead = line.len() - line.trim_start().len();
+                while stack.last().is_some_and(|o| lead < o.col) {
+                    stack.pop();
+                }
+            } else {
+                stack.clear();
+            }
+            continue;
+        };
+        let indent = indent as usize;
+        // the item this one follows in the same list, if any
+        let mut sibling = None;
+        while stack.last().is_some_and(|o| indent < o.col) {
+            sibling = stack.pop();
+        }
+        let number = match kind {
+            LineKind::Numbered { number, delim, .. } => Some((delim, number)),
+            _ => None,
+        };
+        let (list, number) = match (sibling, number) {
+            (Some(s), Some((delim, _))) if s.number.is_some_and(|(d, _)| d == delim) => {
+                let shown = s.number.map_or(0, |(_, n)| n).saturating_add(1);
+                (s.list, Some((delim, shown)))
+            }
+            (Some(s), None) if s.number.is_none() => (s.list, None),
+            (_, number) => {
+                digits.push(0);
+                (digits.len() - 1, number)
+            }
+        };
+        if let Some((_, shown)) = number {
+            digits[list] = digits[list].max(shown.to_string().len() as u8);
+        }
+        out[n].level = stack.len().min(u8::MAX as usize) as u8;
+        out[n].number = number.map_or(0, |(_, shown)| shown);
+        list_of[n] = Some(list);
+        stack.push(Open {
+            col: kind.content_column(),
+            list,
+            number,
+        });
+    }
+    for (n, list) in list_of.into_iter().enumerate() {
+        if let (Some(list), LineKind::Numbered { .. }) = (list, kinds[n]) {
+            out[n].digits = digits[list];
+        }
+    }
+
+    // quotes: lines in a row; an alert if the first says so
+    let quoted = |n: usize| match (kinds[n], blocks.get(n).copied()) {
+        (LineKind::Quote { depth, .. }, _) | (_, Some(Block::Quote { depth })) => depth,
+        _ => 0,
+    };
+    let mut n = 0;
+    while n < kinds.len() {
+        if quoted(n) == 0 {
+            n += 1;
+            continue;
+        }
+        let first = n;
+        while n < kinds.len() && quoted(n) > 0 {
+            n += 1;
+        }
+        let alert = if quoted(first) == 1 {
+            let line = text(first);
+            let start = if kinds[first] == LineKind::Raw {
+                quote_text(&line)
+            } else {
+                0
+            };
+            Alert::parse(&line[start..])
+        } else {
+            None
+        };
+        for (m, shape) in out.iter_mut().enumerate().take(n).skip(first) {
+            shape.quote_first = m == first;
+            shape.quote_last = m + 1 == n;
+            shape.alert = alert;
+        }
     }
     out
 }
@@ -1160,34 +1893,90 @@ pub fn table_step(
     all.get(next).map(|(r, _, end)| (*r, *end))
 }
 
-/// What a link, bare URL, code span or `<kbd>` key is.
+/// What an inline thing the editor draws is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InlineKind {
     Link,
     Url,
     Code,
     Kbd,
+    /// `![alt](src)` or `<img src alt>`: `text` is the alt text, `url` the
+    /// source.
+    Image,
+    /// Formatting written out in raw text (a table cell, a quote kept as
+    /// written, a link's text, HTML tags).
+    Bold,
+    Italic,
+    Strike,
+    Underline,
+    /// `==marked==` or `<mark>`.
+    Highlight,
+    Sup,
+    Sub,
+    /// `$math$`, and `$$math$$` inside a line.
+    Math,
+    /// A footnote reference, `[^1]`: `text` is its label.
+    Footnote,
+    /// `[^1]:` starting a footnote's text.
+    FootnoteDef,
+    /// `:smile:`; `url` is the emoji.
+    Emoji,
+    /// `<!-- a comment -->`.
+    Comment,
+    /// Any other HTML tag: only its syntax is drawn, faintly.
+    Tag,
+    /// A line break written out: a backslash ending the line, or `<br>`.
+    Break,
 }
 
-/// A link, bare URL, code span or `<kbd>` key in a line, in char offsets.
-/// `text` is what reads as its content; the rest of `whole` is syntax.
+/// Something drawn inside a line, in char offsets. `text` is what reads
+/// as its content; the rest of `whole` is syntax.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inline {
     pub kind: InlineKind,
     pub whole: Range<usize>,
     pub text: Range<usize>,
-    /// Where a link goes; empty for code and keys.
+    /// Where a link or image goes, or the emoji; empty otherwise.
     pub url: String,
 }
 
-/// Finds the links, bare URLs, code spans and `<kbd>` keys of a line. Only
-/// raw runs are Markdown (text typed in Kludd is literal), but a bare URL
-/// reads as a link wherever it is.
+impl Inline {
+    fn new(kind: InlineKind, whole: Range<usize>, text: Range<usize>) -> Inline {
+        Inline {
+            kind,
+            whole,
+            text,
+            url: String::new(),
+        }
+    }
+
+    /// Whether `i` is taken by this, so nothing else is found there: all
+    /// of a code span or link, just the syntax of formatting around text.
+    fn claims(&self, i: usize) -> bool {
+        use InlineKind::*;
+        let around = matches!(
+            self.kind,
+            Bold | Italic | Strike | Underline | Highlight | Sup | Sub
+        );
+        self.whole.contains(&i) && !(around && self.text.contains(&i))
+    }
+}
+
+fn claimed(out: &[Inline], i: usize) -> bool {
+    out.iter().any(|x| x.claims(i))
+}
+
+/// Finds what is drawn inside a line: links, bare URLs, code spans,
+/// `<kbd>` keys, images, math, footnotes, HTML and the formatting in raw
+/// text. Only raw runs are Markdown (text typed in Kludd is literal), but
+/// a bare URL, a footnote, a highlight or an emoji reads as one wherever it
+/// is, as it would on GitHub.
 pub fn inlines(spans: &[Span]) -> Vec<Inline> {
     let markdown = spans
         .iter()
         .any(|s| s.style.has(Style::RAW) && !s.text.trim().is_empty());
-    if !markdown && !spans.iter().any(|s| s.text.contains("://")) {
+    let hint = |s: &Span| s.text.contains([':', '=', '[', '\\']);
+    if !markdown && !spans.iter().any(hint) {
         return Vec::new();
     }
     let chars: Vec<(char, bool)> = spans
@@ -1212,39 +2001,66 @@ pub fn inlines(spans: &[Span]) -> Vec<Inline> {
         raw_inlines(&run, start, &mut out);
     }
     kbd_keys(&chars, &mut out);
+    html_tags(&chars, &mut out);
+    footnotes(&chars, &mut out);
     bare_urls(&chars, &mut out);
+    highlights(&chars, &mut out);
+    emoji_codes(&chars, &mut out);
+    // a backslash ending the line breaks it (and an escaped one is literal)
+    if let Some(last) = spans.last()
+        && last.text.ends_with('\\')
+        && !last.style.has(Style::ESCAPED)
+    {
+        let n = chars.len();
+        let slashes = chars.iter().rev().take_while(|(c, _)| *c == '\\').count();
+        if (slashes % 2 == 1 || !last.style.has(Style::RAW)) && !claimed(&out, n - 1) {
+            out.push(Inline::new(InlineKind::Break, n - 1..n, n..n));
+        }
+    }
     out.sort_by_key(|i| i.whole.start);
     out
 }
 
-/// Links and code spans in a run of Markdown source starting at char `base`.
+/// Links, code spans, images, math and formatting in a run of Markdown
+/// source starting at char `base`.
 fn raw_inlines(run: &str, base: usize, out: &mut Vec<Inline>) {
     let lead = run.len() - run.trim_start().len();
     let src = &run[lead..];
     let at = |byte: usize| base + run[..lead + byte].chars().count();
-    // open links: whole source, destination, extent of the text inside
-    let mut links: Vec<(Range<usize>, String, Option<Range<usize>>)> = Vec::new();
-    let mut images = 0;
+    // open links and images: whole source, destination, extent of the text
+    type Open = (InlineKind, Range<usize>, String, Option<Range<usize>>);
+    let mut links: Vec<Open> = Vec::new();
+    let mut marks: Vec<(InlineKind, Range<usize>)> = Vec::new();
     for (event, range) in Parser::new_ext(src, options()).into_offset_iter() {
+        let in_image = links.iter().any(|(k, ..)| *k == InlineKind::Image);
         match &event {
             Event::Start(Tag::Link {
                 link_type,
                 dest_url,
                 ..
-            }) if images == 0 => {
+            }) if !in_image => {
                 let url = if *link_type == pulldown_cmark::LinkType::Email {
                     format!("mailto:{dest_url}")
                 } else {
                     dest_url.to_string()
                 };
-                links.push((range, url, None));
+                links.push((InlineKind::Link, range, url, None));
                 continue;
             }
-            Event::End(TagEnd::Link) if images == 0 => {
-                if let Some((whole, url, text)) = links.pop() {
-                    let text = text.unwrap_or(whole.start + 1..whole.start + 1);
+            Event::Start(Tag::Image { dest_url, .. }) if !in_image => {
+                links.push((InlineKind::Image, range, dest_url.to_string(), None));
+                continue;
+            }
+            Event::End(TagEnd::Link | TagEnd::Image)
+                if links.last().is_some_and(|(k, ..)| {
+                    (*k == InlineKind::Image) == matches!(event, Event::End(TagEnd::Image))
+                }) =>
+            {
+                if let Some((kind, whole, url, text)) = links.pop() {
+                    let open = if kind == InlineKind::Image { 2 } else { 1 };
+                    let text = text.unwrap_or(whole.start + open..whole.start + open);
                     out.push(Inline {
-                        kind: InlineKind::Link,
+                        kind,
                         whole: at(whole.start)..at(whole.end),
                         text: at(text.start)..at(text.end),
                         url,
@@ -1252,21 +2068,57 @@ fn raw_inlines(run: &str, base: usize, out: &mut Vec<Inline>) {
                 }
                 continue;
             }
-            Event::Start(Tag::Image { .. }) => images += 1,
-            Event::End(TagEnd::Image) => images -= 1,
-            Event::Code(_) if images == 0 => {
+            _ if in_image => {}
+            Event::Start(tag @ (Tag::Strong | Tag::Emphasis | Tag::Strikethrough)) => {
+                let kind = match tag {
+                    Tag::Strong => InlineKind::Bold,
+                    Tag::Emphasis => InlineKind::Italic,
+                    _ => InlineKind::Strike,
+                };
+                marks.push((kind, range.clone()));
+            }
+            Event::End(TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough) => {
+                if let Some((kind, whole)) = marks.pop() {
+                    // the delimiter run: `**`, `_`, `~~`...
+                    let first = src.as_bytes()[whole.start];
+                    let n = src[whole.clone()]
+                        .bytes()
+                        .take_while(|&b| b == first)
+                        .count()
+                        .min(if kind == InlineKind::Italic { 1 } else { 2 });
+                    if whole.len() > 2 * n {
+                        out.push(Inline::new(
+                            kind,
+                            at(whole.start)..at(whole.end),
+                            at(whole.start + n)..at(whole.end - n),
+                        ));
+                    }
+                }
+            }
+            Event::Code(_) => {
                 let ticks = src[range.clone()].chars().take_while(|&c| c == '`').count();
-                out.push(Inline {
-                    kind: InlineKind::Code,
-                    whole: at(range.start)..at(range.end),
-                    text: at(range.start + ticks)..at(range.end - ticks),
-                    url: String::new(),
-                });
+                out.push(Inline::new(
+                    InlineKind::Code,
+                    at(range.start)..at(range.end),
+                    at(range.start + ticks)..at(range.end - ticks),
+                ));
+            }
+            Event::InlineMath(_) | Event::DisplayMath(_) => {
+                let dollars = src[range.clone()]
+                    .chars()
+                    .take_while(|&c| c == '$')
+                    .count()
+                    .min(range.len() / 2);
+                out.push(Inline::new(
+                    InlineKind::Math,
+                    at(range.start)..at(range.end),
+                    at(range.start + dollars)..at(range.end - dollars),
+                ));
             }
             _ => {}
         }
         // everything inside a link is its text
-        if let Some((_, _, text)) = links.last_mut() {
+        if let Some((_, _, _, text)) = links.last_mut() {
             *text = Some(match text.take() {
                 Some(t) => t.start.min(range.start)..t.end.max(range.end),
                 None => range,
@@ -1294,17 +2146,362 @@ fn kbd_keys(chars: &[(char, bool)], out: &mut Vec<Inline>) {
         let close = (text..chars.len()).find(|&j| chars[j].0 == '<');
         match close {
             Some(j) if j > text && raw_at(j, "</kbd>") => {
-                out.push(Inline {
-                    kind: InlineKind::Kbd,
-                    whole: i..j + 6,
-                    text: text..j,
-                    url: String::new(),
-                });
+                out.push(Inline::new(InlineKind::Kbd, i..j + 6, text..j));
                 i = j + 6;
             }
             _ => i = text,
         }
     }
+}
+
+/// An HTML tag written as Markdown (raw) at `i`: its end, name (lower
+/// case), whether it closes, and its attributes' source.
+fn html_tag(chars: &[(char, bool)], i: usize) -> Option<(usize, String, bool, String)> {
+    if chars.get(i)?.0 != '<' || !chars[i].1 {
+        return None;
+    }
+    let mut j = i + 1;
+    let closing = chars.get(j)?.0 == '/';
+    if closing {
+        j += 1;
+    }
+    let name_start = j;
+    while chars
+        .get(j)
+        .is_some_and(|(c, _)| c.is_ascii_alphanumeric() || *c == '-')
+    {
+        j += 1;
+    }
+    if j == name_start || !chars[name_start].0.is_ascii_alphabetic() {
+        return None;
+    }
+    let name: String = chars[name_start..j]
+        .iter()
+        .map(|(c, _)| c.to_ascii_lowercase())
+        .collect();
+    let attrs_start = j;
+    let mut quote = None;
+    while let Some(&(c, raw)) = chars.get(j) {
+        if !raw {
+            return None;
+        }
+        match (quote, c) {
+            (None, '>') => break,
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            _ => {}
+        }
+        j += 1;
+    }
+    chars.get(j)?;
+    let attrs = chars[attrs_start..j].iter().map(|(c, _)| c).collect();
+    Some((j + 1, name, closing, attrs))
+}
+
+/// The value of attribute `name` in a tag's attributes.
+fn attribute(attrs: &str, name: &str) -> Option<String> {
+    let lower = attrs.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(found) = lower[from..].find(name) {
+        let at = from + found;
+        from = at + name.len();
+        let before = lower[..at].chars().last();
+        if before.is_some_and(|c| !c.is_whitespace()) {
+            continue;
+        }
+        let rest = attrs[from..].trim_start().strip_prefix('=')?.trim_start();
+        return Some(match rest.chars().next()? {
+            q @ ('"' | '\'') => rest[1..].split(q).next()?.to_string(),
+            _ => rest
+                .split(|c: char| c.is_whitespace() || c == '/')
+                .next()?
+                .to_string(),
+        });
+    }
+    None
+}
+
+/// Inline HTML and comments written as Markdown (raw).
+fn html_tags(chars: &[(char, bool)], out: &mut Vec<Inline>) {
+    let text: Vec<char> = chars.iter().map(|(c, _)| *c).collect();
+    let starts_with = |i: usize, s: &str| {
+        let n = s.chars().count();
+        i + n <= text.len() && text[i..i + n].iter().copied().eq(s.chars())
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].0 != '<' || !chars[i].1 || claimed(out, i) {
+            i += 1;
+            continue;
+        }
+        if starts_with(i, "<!--") {
+            let end = (i + 4..text.len())
+                .find(|&j| starts_with(j, "-->"))
+                .map_or(text.len(), |j| j + 3);
+            let inner = (i + 4).min(end)..end.saturating_sub(3).max(i + 4).min(end);
+            out.push(Inline::new(InlineKind::Comment, i..end, inner));
+            i = end;
+            continue;
+        }
+        let Some((end, name, closing, attrs)) = html_tag(chars, i) else {
+            i += 1;
+            continue;
+        };
+        if name == "kbd" {
+            i = end;
+            continue;
+        }
+        let void = matches!(name.as_str(), "br" | "img" | "hr" | "wbr") || attrs.ends_with('/');
+        let kind = match name.as_str() {
+            "b" | "strong" | "summary" => Some(InlineKind::Bold),
+            "i" | "em" | "cite" | "var" => Some(InlineKind::Italic),
+            "s" | "del" | "strike" => Some(InlineKind::Strike),
+            "u" | "ins" => Some(InlineKind::Underline),
+            "mark" => Some(InlineKind::Highlight),
+            "sup" => Some(InlineKind::Sup),
+            "sub" => Some(InlineKind::Sub),
+            "code" | "samp" => Some(InlineKind::Code),
+            "a" => Some(InlineKind::Link),
+            _ => None,
+        };
+        // an element closed later on the line draws its content; anything
+        // else is just a tag
+        let close = (!closing && !void && kind.is_some())
+            .then(|| {
+                let mut j = end;
+                while j < chars.len() {
+                    if let Some((e, n, true, _)) = html_tag(chars, j) {
+                        if n == name {
+                            return Some((j, e));
+                        }
+                        j = e;
+                    } else {
+                        j += 1;
+                    }
+                }
+                None
+            })
+            .flatten();
+        match (kind, close) {
+            (Some(kind), Some((j, e))) => {
+                let mut item = Inline::new(kind, i..e, end..j);
+                if kind == InlineKind::Link {
+                    item.url = attribute(&attrs, "href").unwrap_or_default();
+                }
+                out.push(item);
+                i = end;
+            }
+            _ if name == "img" => {
+                let mut item = Inline::new(InlineKind::Image, i..end, end..end);
+                item.url = attribute(&attrs, "src").unwrap_or_default();
+                out.push(item);
+                i = end;
+            }
+            _ => {
+                let kind = if name == "br" {
+                    InlineKind::Break
+                } else {
+                    InlineKind::Tag
+                };
+                out.push(Inline::new(kind, i..end, end..end));
+                i = end;
+            }
+        }
+    }
+}
+
+/// `[^label]` references, and `[^label]:` starting a footnote's text.
+fn footnotes(chars: &[(char, bool)], out: &mut Vec<Inline>) {
+    let text: Vec<char> = chars.iter().map(|(c, _)| *c).collect();
+    let mut i = 0;
+    while i + 3 < text.len() {
+        if text[i] != '[' || text[i + 1] != '^' || claimed(out, i) {
+            i += 1;
+            continue;
+        }
+        let label = i + 2;
+        let Some(close) = (label..text.len())
+            .take_while(|&j| !text[j].is_whitespace() && text[j] != '[')
+            .find(|&j| text[j] == ']')
+            .filter(|&j| j > label)
+        else {
+            i += 1;
+            continue;
+        };
+        // a footnote's text is a raw line: typed, `[^1]:` is just text
+        let at_start = text[..i].iter().all(|c| *c == ' ') && i <= 3 && chars[i].1;
+        if at_start && text.get(close + 1) == Some(&':') {
+            out.push(Inline::new(
+                InlineKind::FootnoteDef,
+                i..close + 2,
+                label..close,
+            ));
+            i = close + 2;
+        } else {
+            out.push(Inline::new(
+                InlineKind::Footnote,
+                i..close + 1,
+                label..close,
+            ));
+            i = close + 1;
+        }
+    }
+}
+
+/// `==marked==`, as Obsidian and Typora have it.
+fn highlights(chars: &[(char, bool)], out: &mut Vec<Inline>) {
+    let text: Vec<char> = chars.iter().map(|(c, _)| *c).collect();
+    let pair = |i: usize| i + 1 < text.len() && text[i] == '=' && text[i + 1] == '=';
+    let free = |out: &[Inline], i: usize| !claimed(out, i) && !claimed(out, i + 1);
+    let mut i = 0;
+    while i + 4 < text.len() {
+        let opens = pair(i)
+            && (i == 0 || text[i - 1] != '=')
+            && !text[i + 2].is_whitespace()
+            && text[i + 2] != '='
+            && free(out, i);
+        if !opens {
+            i += 1;
+            continue;
+        }
+        let close = (i + 3..text.len().saturating_sub(1)).find(|&j| {
+            pair(j) && !text[j - 1].is_whitespace() && text.get(j + 2) != Some(&'=') && free(out, j)
+        });
+        match close {
+            Some(j) => {
+                out.push(Inline::new(InlineKind::Highlight, i..j + 2, i + 2..j));
+                i = j + 2;
+            }
+            None => i += 2,
+        }
+    }
+}
+
+/// `:shortcode:` emoji, as GitHub has them.
+fn emoji_codes(chars: &[(char, bool)], out: &mut Vec<Inline>) {
+    let text: Vec<char> = chars.iter().map(|(c, _)| *c).collect();
+    let name_char = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || "_+-".contains(c);
+    let mut i = 0;
+    while i + 2 < text.len() {
+        if text[i] != ':' || (i > 0 && text[i - 1].is_alphanumeric()) || claimed(out, i) {
+            i += 1;
+            continue;
+        }
+        let end = (i + 1..text.len())
+            .take_while(|&j| name_char(text[j]) || text[j] == ':')
+            .find(|&j| text[j] == ':');
+        let Some(end) = end.filter(|&j| j > i + 1) else {
+            i += 1;
+            continue;
+        };
+        let name: String = text[i + 1..end].iter().collect();
+        let after = text.get(end + 1);
+        match emoji(&name) {
+            Some(emoji) if !after.is_some_and(|c| c.is_alphanumeric()) && !claimed(out, end) => {
+                let mut item = Inline::new(InlineKind::Emoji, i..end + 1, i..end + 1);
+                item.url = emoji.to_string();
+                out.push(item);
+                i = end + 1;
+            }
+            _ => i = end,
+        }
+    }
+}
+
+/// The emoji for a GitHub shortcode (`smile` gives 😄).
+pub fn emoji(name: &str) -> Option<&'static str> {
+    static TABLE: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut table: Vec<(&str, &str)> = include_str!("../assets/emoji.txt")
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .collect();
+        table.sort_unstable_by_key(|(name, _)| *name);
+        table
+    });
+    table
+        .binary_search_by_key(&name, |(n, _)| n)
+        .ok()
+        .map(|i| table[i].1)
+}
+
+/// A link reference definition, `[label]: https://…`: its label (as
+/// Markdown matches labels, case and spacing aside) and destination.
+pub fn reference_definition(line: &str) -> Option<(String, String)> {
+    let rest = unindent(line)?.strip_prefix('[')?;
+    let close = rest.find("]:")?;
+    let label = &rest[..close];
+    if label.trim().is_empty() || label.starts_with('^') || label.contains(['[', ']']) {
+        return None;
+    }
+    let dest = rest[close + 2..].split_whitespace().next()?;
+    let dest = dest
+        .strip_prefix('<')
+        .and_then(|d| d.strip_suffix('>'))
+        .unwrap_or(dest);
+    Some((reference_label(label), dest.to_string()))
+}
+
+fn reference_label(label: &str) -> String {
+    label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Links to the note's reference definitions: `[text][label]`,
+/// `[label][]` and `[label]`, where `label` is defined in `refs`.
+pub fn reference_links(spans: &[Span], refs: &HashMap<String, String>, out: &mut Vec<Inline>) {
+    if refs.is_empty() {
+        return;
+    }
+    let text: Vec<char> = spans.iter().flat_map(|s| s.text.chars()).collect();
+    // `[`...`]` from `open`, with no brackets between: where `]` is
+    let close = |open: usize| {
+        (open + 1..text.len())
+            .take_while(|&j| text[j] != '[')
+            .find(|&j| text[j] == ']')
+    };
+    let found = out.len();
+    let mut i = 0;
+    while i < text.len() {
+        if text[i] != '[' || text.get(i + 1) == Some(&'^') || claimed(&out[..found], i) {
+            i += 1;
+            continue;
+        }
+        let Some(first) = close(i) else {
+            i += 1;
+            continue;
+        };
+        let inner: String = text[i + 1..first].iter().collect();
+        let (end, label) = match text.get(first + 1) {
+            Some('[') => match close(first + 1) {
+                Some(second) if second == first + 2 => (second + 1, inner.clone()),
+                Some(second) => (second + 1, text[first + 2..second].iter().collect()),
+                None => {
+                    i = first + 1;
+                    continue;
+                }
+            },
+            // `[x](…)` is an inline link, `[x]:` a definition
+            Some('(' | ':') => {
+                i = first + 1;
+                continue;
+            }
+            _ => (first + 1, inner.clone()),
+        };
+        match refs.get(&reference_label(&label)) {
+            Some(url) if !inner.trim().is_empty() && !claimed(&out[..found], end - 1) => {
+                let mut item = Inline::new(InlineKind::Link, i..end, i + 1..first);
+                item.url = url.clone();
+                out.push(item);
+                i = end;
+            }
+            _ => i = first + 1,
+        }
+    }
+    out.sort_by_key(|i| i.whole.start);
 }
 
 /// `https://…` written out, outside what was found already. Punctuation at
@@ -1315,7 +2512,7 @@ fn bare_urls(chars: &[(char, bool)], out: &mut Vec<Inline>) {
         let n = s.chars().count();
         i + n <= text.len() && text[i..i + n].iter().copied().eq(s.chars())
     };
-    let taken: Vec<Range<usize>> = out.iter().map(|i| i.whole.clone()).collect();
+    let found = out.len();
     let mut i = 0;
     while i < text.len() {
         let scheme = ["https://", "http://"]
@@ -1323,7 +2520,7 @@ fn bare_urls(chars: &[(char, bool)], out: &mut Vec<Inline>) {
             .find(|s| starts_with(i, s))
             .map(|s| s.len());
         let fresh = i == 0 || !text[i - 1].is_alphanumeric();
-        let Some(scheme) = scheme.filter(|_| fresh && !taken.iter().any(|r| r.contains(&i))) else {
+        let Some(scheme) = scheme.filter(|_| fresh && !claimed(&out[..found], i)) else {
             i += 1;
             continue;
         };
@@ -1331,7 +2528,7 @@ fn bare_urls(chars: &[(char, bool)], out: &mut Vec<Inline>) {
         while end < text.len()
             && !text[end].is_whitespace()
             && text[end] != '<'
-            && !taken.iter().any(|r| r.contains(&end))
+            && !claimed(&out[..found], end)
         {
             end += 1;
         }
@@ -1349,12 +2546,9 @@ fn bare_urls(chars: &[(char, bool)], out: &mut Vec<Inline>) {
             }
         }
         if end > i + scheme {
-            out.push(Inline {
-                kind: InlineKind::Url,
-                whole: i..end,
-                text: i..end,
-                url: text[i..end].iter().collect(),
-            });
+            let mut item = Inline::new(InlineKind::Url, i..end, i..end);
+            item.url = text[i..end].iter().collect();
+            out.push(item);
         }
         i = end.max(i + 1);
     }
@@ -1472,10 +2666,14 @@ mod tests {
             .collect();
         assert!(raw.contains(&"fn main() { **not bold** }".to_string()));
         assert!(raw.contains(&"| 1 | 2 |".to_string()));
-        assert!(raw.contains(&"> quote".to_string()));
-        assert!(raw.contains(&"1. one".to_string()));
-        assert!(raw.contains(&"### deep".to_string()));
+        assert!(raw.contains(&"---".to_string()));
+        assert!(raw.contains(&"<div>".to_string()));
         assert!(raw.contains(&"[ref]: https://example.com".to_string()));
+        // quotes, numbered lists and deeper headings are rich lines now
+        let kind_of = |text: &str| lines.iter().find(|l| l.text() == text).map(|l| l.kind);
+        assert_eq!(kind_of("quote"), Some(LineKind::quote(1)));
+        assert_eq!(kind_of("one"), Some(LineKind::numbered(0, 1)));
+        assert_eq!(kind_of("deep"), Some(LineKind::H3));
     }
 
     #[test]
@@ -1527,7 +2725,8 @@ mod tests {
             lines[3].kind,
             LineKind::Bullet {
                 indent: 0,
-                marker: b'*'
+                marker: b'*',
+                task: None,
             }
         );
     }
@@ -1701,6 +2900,7 @@ mod tests {
             Style::BOLD,
             Style::ITALIC,
             Style::UNDERLINE,
+            Style::STRIKE,
             Style::BOLD.with(Style::ITALIC),
             Style::BOLD.with(Style::UNDERLINE),
         ];
@@ -1708,8 +2908,14 @@ mod tests {
             LineKind::Text,
             LineKind::H1,
             LineKind::H2,
+            LineKind::H4,
             LineKind::bullet(0),
             LineKind::bullet(2),
+            LineKind::numbered(0, 3),
+            LineKind::bullet(0).with_task(Some(Task::Open)),
+            LineKind::numbered(3, 1).with_task(Some(Task::Done(b'x'))),
+            LineKind::quote(1),
+            LineKind::quote(2),
         ];
         let mut rng = Rng(0xDEADBEEF12345678);
         let mut rich = 0;
@@ -1854,12 +3060,12 @@ mod tests {
     fn blocks_of(src: &str) -> Vec<Block> {
         let lines = parse(src);
         let texts: Vec<String> = lines.iter().map(Line::text).collect();
-        let raw: Vec<Option<&str>> = lines
+        let lines: Vec<(LineKind, &str)> = lines
             .iter()
             .zip(&texts)
-            .map(|(l, t)| (l.kind == LineKind::Raw).then_some(t.as_str()))
+            .map(|(l, t)| (l.kind, t.as_str()))
             .collect();
-        blocks(&raw)
+        blocks(&lines)
     }
 
     #[test]
@@ -2001,19 +3207,346 @@ mod tests {
             [(Url, "http://a.b".into(), "http://a.b".into())]
         );
 
-        // raw lines (a table row, a quote) have them too; autolinks and mail
-        let row = &parse("> [**b**](u) <https://a.b> <me@x.y> ``a`b``\n")[0];
+        // raw lines (a table row, a list in a quote) have them too, and
+        // their formatting; autolinks and mail
+        let row = &parse("> - [**b**](u) <https://a.b> <me@x.y> ``a`b``\n")[0];
         assert_eq!(row.kind, LineKind::Raw);
         assert_eq!(
             found(&row.spans),
             [
                 (Link, "**b**".into(), "u".into()),
+                (Bold, "b".into(), String::new()),
                 (Link, "https://a.b".into(), "https://a.b".into()),
                 (Link, "me@x.y".into(), "mailto:me@x.y".into()),
                 (Code, "a`b".into(), String::new()),
             ]
         );
         // an image is no link
-        assert!(found(&parse("![alt](pic.png)\n")[0].spans).is_empty());
+        assert_eq!(
+            found(&parse("![alt](pic.png)\n")[0].spans),
+            [(Image, "alt".into(), "pic.png".into())]
+        );
+    }
+
+    #[test]
+    fn new_kinds_round_trip() {
+        let src = "### Three\n#### Four\n##### Five\n###### Six\n\
+            1. one\n2. two\n10. ten\n3) paren\n   1. nested\n\
+            - [ ] todo\n- [x] done\n- [X] Done\n  * [ ] deep\n1. [ ] numbered task\n- [ ] \n\
+            > quote\n>\n> more *of* it\n>no space\n> > nested\n>> tight\n\n\
+            ~~gone~~ and ~one~ tilde, $x^2$ math\n";
+        round_trip(src);
+        let lines = parse(src);
+        let kinds: Vec<LineKind> = lines.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds[0..4],
+            [LineKind::H3, LineKind::H4, LineKind::H5, LineKind::H6]
+        );
+        assert_eq!(kinds[4], LineKind::numbered(0, 1));
+        assert_eq!(kinds[6], LineKind::numbered(0, 10));
+        assert!(matches!(
+            kinds[7],
+            LineKind::Numbered {
+                number: 3,
+                delim: b')',
+                ..
+            }
+        ));
+        assert_eq!(kinds[8].list_indent(), Some(3));
+        assert_eq!(kinds[9].task(), Some(Task::Open));
+        assert_eq!(kinds[10].task(), Some(Task::Done(b'x')));
+        assert_eq!(kinds[11].task(), Some(Task::Done(b'X')));
+        assert!(matches!(
+            kinds[12],
+            LineKind::Bullet {
+                indent: 2,
+                marker: b'*',
+                task: Some(Task::Open)
+            }
+        ));
+        assert!(matches!(
+            kinds[13],
+            LineKind::Numbered {
+                task: Some(Task::Open),
+                ..
+            }
+        ));
+        assert_eq!(kinds[14].task(), Some(Task::Open), "an empty task");
+        assert_eq!(kinds[15], LineKind::quote(1));
+        assert_eq!(
+            kinds[16],
+            LineKind::Quote {
+                depth: 1,
+                spaces: 0
+            }
+        );
+        assert_eq!(lines[17].text(), "more of it");
+        assert_eq!(
+            kinds[18],
+            LineKind::Quote {
+                depth: 1,
+                spaces: 0
+            }
+        );
+        assert_eq!(kinds[19], LineKind::quote(2));
+        assert_eq!(
+            kinds[20],
+            LineKind::Quote {
+                depth: 2,
+                spaces: 2
+            }
+        );
+        // ~~x~~ is strikethrough; ~x~ and math stay as written
+        let last = &lines[22];
+        assert_eq!(last.kind, LineKind::Text);
+        assert_eq!(last.spans[0], Span::new("gone", Style::STRIKE));
+        assert!(
+            last.spans
+                .iter()
+                .any(|s| s.text == "~one~" && s.style.has(Style::RAW))
+        );
+        assert!(
+            last.spans
+                .iter()
+                .any(|s| s.text == "$x^2$" && s.style.has(Style::RAW))
+        );
+    }
+
+    #[test]
+    fn typed_text_in_new_kinds_stays_literal() {
+        // what is typed reads back as typed, whatever the line is
+        for (kind, text) in [
+            (LineKind::quote(1), "> not deeper"),
+            (LineKind::bullet(0), "[ ] not a task"),
+            (LineKind::numbered(0, 1), "2. not nested"),
+            (LineKind::Text, "costs $5-$10"),
+            (LineKind::Text, "[^1]: not a footnote"),
+            (LineKind::H3, "### not deeper"),
+        ] {
+            let spans = vec![Span::new(text, Style::NONE)];
+            let md = serialize_line(kind, &spans);
+            let line = &parse(&md)[0];
+            assert_eq!((line.kind, line.text()), (kind, text.to_string()), "{md:?}");
+        }
+        assert_eq!(
+            serialize_line(LineKind::Text, &[Span::new("x", Style::STRIKE)]),
+            "~~x~~"
+        );
+        assert_eq!(
+            serialize_line(
+                LineKind::numbered(2, 7).with_task(Some(Task::Done(b'x'))),
+                &[]
+            ),
+            "  7. [x] "
+        );
+    }
+
+    fn kinds_and_blocks(src: &str) -> (Vec<LineKind>, Vec<Block>) {
+        let lines = parse(src);
+        let kinds = lines.iter().map(|l| l.kind).collect();
+        (kinds, blocks_of(src))
+    }
+
+    #[test]
+    fn finds_rules_headings_math_and_indented_code() {
+        use Block::*;
+        let src = "Title\n=====\n\nSub\n---\n\n***\n\n- - -\n\n    code\n\n    more\n\nafter\n\n$$\nx^2\n$$\n\n$$ y $$\n\n> - quoted list\n";
+        round_trip(src);
+        let (_, blocks) = kinds_and_blocks(src);
+        assert_eq!(
+            blocks,
+            [
+                SetextText { level: 1 },
+                SetextRule { level: 1 },
+                None,
+                SetextText { level: 2 },
+                SetextRule { level: 2 },
+                None,
+                Rule,
+                None,
+                Rule,
+                None,
+                Indented {
+                    first: true,
+                    last: false
+                },
+                Indented {
+                    first: false,
+                    last: false
+                },
+                Indented {
+                    first: false,
+                    last: true
+                },
+                None,
+                None,
+                None,
+                MathOpen,
+                Math,
+                MathClose,
+                None,
+                MathLine,
+                None,
+                Quote { depth: 1 },
+            ]
+        );
+        // $$ left open is no block yet; a list item's indented text is no code
+        assert_eq!(blocks_of("$$\nx\n"), [None, None]);
+        assert_eq!(blocks_of("- a\n\n    b\n"), [None, None, None]);
+    }
+
+    #[test]
+    fn lists_nest_and_count_like_markdown() {
+        let src = "1. a\n1. b\n   - c\n   - d\n     1. e\n1. f\n\n1. g\ntext\n5. h\n6. i\n- [ ] j\n  - k\n";
+        let lines = parse(src);
+        let kinds: Vec<LineKind> = lines.iter().map(|l| l.kind).collect();
+        let texts: Vec<String> = lines.iter().map(Line::text).collect();
+        let shapes = shapes(&kinds, &vec![Block::None; kinds.len()], |n| {
+            texts[n].clone()
+        });
+        let numbers: Vec<(u8, u32)> = shapes.iter().map(|s| (s.level, s.number)).collect();
+        assert_eq!(
+            numbers,
+            [
+                (0, 1),
+                (0, 2),
+                (1, 0),
+                (1, 0),
+                (2, 1),
+                (0, 3),
+                (0, 0),
+                (0, 4),
+                (0, 0),
+                (0, 5),
+                (0, 6),
+                (0, 0),
+                (1, 0),
+            ],
+            "a blank line keeps a list going, text ends it; a list counts on from its first number"
+        );
+        assert_eq!(shapes[9].digits, 1);
+        let long = (1..=12).map(|i| format!("{i}. x\n")).collect::<String>();
+        let kinds: Vec<LineKind> = parse(&long).iter().map(|l| l.kind).collect();
+        let wide = super::shapes(&kinds, &[Block::None; 12], |_| String::new());
+        assert!(wide.iter().all(|s| s.digits == 2), "they line up after 12.");
+        // Tab goes in under the item before, Shift+Tab out to the parent
+        let kinds: Vec<LineKind> = parse("- a\n- b\n  - c\n10. d\n11. e\n")
+            .iter()
+            .map(|l| l.kind)
+            .collect();
+        assert_eq!(list_moves(&kinds, 1), (Some(2), None));
+        assert_eq!(list_moves(&kinds, 2), (None, Some(0)));
+        assert_eq!(list_moves(&kinds, 4), (Some(4), None));
+        assert_eq!(list_moves(&kinds, 0), (None, None));
+    }
+
+    #[test]
+    fn quotes_and_alerts() {
+        let src = "> [!WARNING]\n> Careful.\n\n> plain\n> quote\n\n> [!nope]\n";
+        let lines = parse(src);
+        let kinds: Vec<LineKind> = lines.iter().map(|l| l.kind).collect();
+        let texts: Vec<String> = lines.iter().map(Line::text).collect();
+        let shapes = shapes(&kinds, &blocks_of(src), |n| texts[n].clone());
+        assert_eq!(shapes[0].alert, Some(Alert::Warning));
+        assert_eq!(shapes[1].alert, Some(Alert::Warning));
+        assert!(shapes[0].quote_first && shapes[1].quote_last);
+        assert_eq!(shapes[3].alert, None);
+        assert!(shapes[3].quote_first && !shapes[3].quote_last && shapes[4].quote_last);
+        assert_eq!(shapes[6].alert, None);
+        assert_eq!(Alert::parse(" [!tip] "), Some(Alert::Tip));
+    }
+
+    #[test]
+    fn finds_the_rest_inline() {
+        use InlineKind::*;
+        let spans = |src: &str| parse(src).remove(0).spans;
+        assert_eq!(
+            found(&spans("a ==mark== b and a == b == c\n")),
+            [(Highlight, "mark".into(), String::new())]
+        );
+        assert_eq!(
+            found(&spans("see[^note] and :tada: but not a:b:c or :nope:\n")),
+            [
+                (Footnote, "note".into(), String::new()),
+                (Emoji, ":tada:".into(), "🎉".into()),
+            ]
+        );
+        assert_eq!(
+            found(&spans("[^note]: the text\n")),
+            [(FootnoteDef, "note".into(), String::new())]
+        );
+        assert_eq!(
+            found(&spans("x $a+b$ y\n")),
+            [(Math, "a+b".into(), String::new())]
+        );
+        assert_eq!(
+            found(&spans(
+                "H<sub>2</sub>O <mark>m</mark> <br> <!-- c --> <a href=\"u\">t</a> <img src=\"p.png\">\n"
+            )),
+            [
+                (Sub, "2".into(), String::new()),
+                (Highlight, "m".into(), String::new()),
+                (Break, String::new(), String::new()),
+                (Comment, " c ".into(), String::new()),
+                (Link, "t".into(), "u".into()),
+                (Image, String::new(), "p.png".into()),
+            ]
+        );
+        assert_eq!(
+            found(&spans("a ~b~ c\n")),
+            [(Strike, "b".into(), String::new())]
+        );
+        assert_eq!(
+            found(&[Span::new("hard break\\", Style::NONE)]),
+            [(Break, String::new(), String::new())]
+        );
+        assert!(found(&[Span::new("escaped\\", Style::ESCAPED)]).is_empty());
+        // typed (not raw), `[^1]:` is text; `$$$$` is empty math
+        assert_eq!(
+            found(&[Span::new("[^1]: typed", Style::NONE)]),
+            [(Footnote, "1".into(), String::new())]
+        );
+        let empty = inlines(&parse("a $$$$ b\n").remove(0).spans);
+        assert!(empty.iter().all(|i| i.text.start <= i.text.end));
+        assert_eq!(emoji("+1"), Some("👍"));
+        assert_eq!(emoji("no_such_emoji"), None);
+    }
+
+    #[test]
+    fn reference_links_find_their_definitions() {
+        let src = "See [the docs][docs], [Docs][] and [docs], not [nope] or [x](y).\n\n[docs]: <https://x.y> \"Title\"\n";
+        round_trip(src);
+        let lines = parse(src);
+        assert_eq!(lines[2].kind, LineKind::Raw);
+        let (label, url) = reference_definition(&lines[2].text()).unwrap();
+        assert_eq!((label.as_str(), url.as_str()), ("docs", "https://x.y"));
+        let refs = HashMap::from([(label, url)]);
+        let mut out = inlines(&lines[0].spans);
+        reference_links(&lines[0].spans, &refs, &mut out);
+        let links: Vec<(String, String)> = out
+            .iter()
+            .filter(|i| i.kind == InlineKind::Link)
+            .map(|i| {
+                (
+                    lines[0]
+                        .text()
+                        .chars()
+                        .skip(i.text.start)
+                        .take(i.text.len())
+                        .collect(),
+                    i.url.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            links,
+            [
+                ("the docs".to_string(), "https://x.y".to_string()),
+                ("Docs".to_string(), "https://x.y".to_string()),
+                ("docs".to_string(), "https://x.y".to_string()),
+                ("x".to_string(), "y".to_string()),
+            ]
+        );
+        assert_eq!(reference_definition("[^1]: a footnote"), None);
     }
 }

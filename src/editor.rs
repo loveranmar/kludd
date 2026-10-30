@@ -6,11 +6,13 @@
 //! tags for rendering. GTK's own undo ignores tags, so undo is done here by
 //! recording line snapshots before and after every change.
 //!
-//! Code blocks, tables, code spans and links are raw Markdown underneath;
-//! the view only draws them differently (boxes, pills, underlines, hidden
-//! syntax), so what is saved never depends on how it looks.
+//! Code blocks, tables, rules, math, code spans, links, images and the like
+//! are raw Markdown underneath; the view only draws them differently
+//! (boxes, pills, underlines, hidden syntax), so what is saved never depends
+//! on how it looks.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
@@ -20,7 +22,9 @@ use gtk::subclass::prelude::*;
 use gtk::{gdk, gio, glib, graphene, gsk, pango};
 
 use crate::config;
-use crate::markdown::{self, Block, Eol, InlineKind, Line, LineKind, Span, Style};
+use crate::markdown::{
+    self, Alert, Block, Eol, InlineKind, Line, LineKind, Shape, Span, Style, Task,
+};
 use crate::scroll;
 use crate::storage;
 use crate::theme::{self, Icon};
@@ -40,9 +44,49 @@ const BLOCK_GAP: f64 = 6.0;
 const CODE_PAD: f64 = 4.0;
 /// Room above and below each table row.
 const ROW_PAD: f64 = 3.0;
+/// How far each quote level is indented, and the room above and below a
+/// quote.
+const QUOTE_INDENT: f64 = 16.0;
+const QUOTE_GAP: f64 = 4.0;
+/// A task's box, and the room around pictures shown under their line.
+const TASK_BOX: f32 = 13.0;
+const PICTURE_GAP: f64 = 8.0;
+
+/// GitHub's alert colours, which read on every theme.
+fn alert_color(alert: Alert) -> gdk::RGBA {
+    let hex = match alert {
+        Alert::Note => "#3B82F6",
+        Alert::Tip => "#1F9D60",
+        Alert::Important => "#8B5CF6",
+        Alert::Warning => "#D08700",
+        Alert::Caution => "#E5484D",
+    };
+    gdk::RGBA::parse(hex).unwrap_or(gdk::RGBA::BLACK)
+}
+
+fn alert_icon(alert: Alert) -> &'static str {
+    match alert {
+        Alert::Note => theme::ICON_NOTE,
+        Alert::Tip => theme::ICON_TIP,
+        Alert::Important => theme::ICON_IMPORTANT,
+        Alert::Warning => theme::ICON_WARNING,
+        Alert::Caution => theme::ICON_CAUTION,
+    }
+}
+
+/// The left margin of a numbered item: room for its list's widest number.
+fn number_margin(level: usize, digits: u8, zoom: f64) -> f64 {
+    let gutter = (digits.max(1) as f64 * 0.6 + 0.3) * 15.0 + 6.0;
+    (20.0 * level as f64 + gutter.max(20.0)) * zoom
+}
+
+/// Pictures shown under a line: (texture, width, height).
+type Pictures = Vec<(gdk::Texture, f32, f32)>;
+type PicturesOf = Box<dyn Fn(usize) -> Pictures>;
 
 // ---------------------------------------------------------------------------
-// The view: draws its own selection (rounded, glyph height) and bullets.
+// The view: draws its own selection (rounded, glyph height), list markers,
+// quotes, rules, boxes and pictures.
 
 mod imp {
     use super::*;
@@ -52,6 +96,12 @@ mod imp {
         pub kinds: RefCell<Vec<LineKind>>,
         /// Each line's part in a code block or table, kept like `kinds`.
         pub blocks: RefCell<Vec<Block>>,
+        /// Each line's list nesting and number, quote edges; kept like
+        /// `kinds`.
+        pub shapes: RefCell<Vec<Shape>>,
+        /// The pictures to show under a line (set by the editor, which
+        /// knows where the note is).
+        pub pictures: RefCell<Option<PicturesOf>>,
         /// Markdown of each line, kept until the line changes, so saving
         /// a long note only serializes what was edited.
         pub cache: RefCell<Vec<Option<String>>>,
@@ -87,10 +137,14 @@ mod imp {
             if layer == gtk::TextViewLayer::BelowText {
                 let view = self.obj();
                 view.draw_blocks(&snapshot);
+                view.draw_quotes(&snapshot);
                 view.draw_boxes(&snapshot);
+                view.draw_marks(&snapshot);
                 view.draw_selection(&snapshot);
                 view.draw_links(&snapshot);
-                view.draw_bullets(&snapshot);
+                view.draw_markers(&snapshot);
+                view.draw_pictures(&snapshot);
+                view.draw_emoji(&snapshot);
             }
             self.parent_snapshot_layer(layer, snapshot);
         }
@@ -109,8 +163,18 @@ impl View {
         view.imp().zoom.set(1.0);
         view.imp().kinds.replace(vec![LineKind::Text]);
         view.imp().blocks.replace(vec![Block::None]);
+        view.imp().shapes.replace(vec![Shape::default()]);
         view.imp().cache.replace(vec![None]);
         view
+    }
+
+    fn shape(&self, line: usize) -> Shape {
+        self.imp()
+            .shapes
+            .borrow()
+            .get(line)
+            .copied()
+            .unwrap_or_default()
     }
 
     fn block(&self, line: usize) -> Block {
@@ -343,7 +407,7 @@ impl View {
             n -= 1;
         }
         while n <= bottom && n < blocks.len() {
-            if blocks[n] == Block::None {
+            if !blocks[n].is_boxed() {
                 n += 1;
                 continue;
             }
@@ -375,7 +439,7 @@ impl View {
                 (ly + lh) as f32 - gap
             };
             let radius = 8.0 * zoom;
-            if blocks[first].is_code() {
+            if blocks[first].is_code() || blocks[first].is_math() {
                 let rect = graphene::Rect::new(0.0, top_y, width, bottom_y - top_y);
                 let outline = gsk::RoundedRect::from_rect(rect, radius);
                 snapshot.push_rounded_clip(&outline);
@@ -550,8 +614,14 @@ impl View {
         }
     }
 
-    fn draw_bullets(&self, snapshot: &gtk::Snapshot) {
+    /// List markers: a dot, the number (as Markdown counts it) or a task's
+    /// box, in the margin before the text.
+    fn draw_markers(&self, snapshot: &gtk::Snapshot) {
         let kinds = self.imp().kinds.borrow();
+        let shapes = self.imp().shapes.borrow();
+        if !kinds.iter().any(|k| k.is_list()) {
+            return;
+        }
         let zoom = self.zoom();
         let color = self.color();
         let visible = self.visible_rect();
@@ -561,14 +631,34 @@ impl View {
             if y > visible.y() + visible.height() {
                 break;
             }
-            if let Some(LineKind::Bullet { indent, .. }) = kinds.get(iter.line() as usize) {
-                let level = (*indent as usize / 2).min(LEVELS - 1) as f32;
+            let n = iter.line() as usize;
+            if let Some(&kind) = kinds.get(n).filter(|k| k.is_list()) {
+                let shape = shapes.get(n).copied().unwrap_or_default();
+                let level = (shape.level as usize).min(LEVELS - 1);
                 let rect = self.iter_location(&iter);
-                let cx = (5.5 + 20.0 * level) * zoom;
                 let cy = rect.y() as f32 + rect.height() as f32 / 2.0 - 0.5 * zoom;
-                let builder = gsk::PathBuilder::new();
-                builder.add_circle(&graphene::Point::new(cx, cy), 2.5 * zoom);
-                snapshot.append_fill(&builder.to_path(), gsk::FillRule::Winding, &color);
+                let left = 20.0 * level as f32 * zoom;
+                match (kind.task(), kind) {
+                    (Some(task), _) => self.draw_task_box(snapshot, left, cy, task),
+                    (None, LineKind::Numbered { delim, .. }) => {
+                        let label = format!("{}{}", shape.number, delim as char);
+                        let layout = self.create_pango_layout(Some(&label));
+                        let (w, h) = layout.pixel_size();
+                        let right = number_margin(level, shape.digits, zoom as f64) as f32;
+                        let x = right - 6.0 * zoom - w as f32;
+                        let y = rect.y() as f32 + (rect.height() - h) as f32 / 2.0;
+                        snapshot.save();
+                        snapshot.translate(&graphene::Point::new(x, y));
+                        snapshot.append_layout(&layout, &tint(&color, 0.85));
+                        snapshot.restore();
+                    }
+                    _ => {
+                        let cx = left + 5.5 * zoom;
+                        let builder = gsk::PathBuilder::new();
+                        builder.add_circle(&graphene::Point::new(cx, cy), 2.5 * zoom);
+                        snapshot.append_fill(&builder.to_path(), gsk::FillRule::Winding, &color);
+                    }
+                }
             }
             let line = iter.line();
             iter.forward_line();
@@ -577,16 +667,222 @@ impl View {
             }
         }
     }
+
+    /// Where a task's box is drawn on a line: its left edge, and size.
+    fn task_box(&self, level: usize) -> (f32, f32) {
+        let zoom = self.zoom();
+        (20.0 * level as f32 * zoom + 1.0 * zoom, TASK_BOX * zoom)
+    }
+
+    /// An open box, or a ticked one filled with the theme's accent.
+    fn draw_task_box(&self, snapshot: &gtk::Snapshot, left: f32, cy: f32, task: Task) {
+        let zoom = self.zoom();
+        let ink = self.color();
+        let size = TASK_BOX * zoom;
+        let rect = graphene::Rect::new(left + 1.0 * zoom, cy - size / 2.0, size, size);
+        let outline = gsk::RoundedRect::from_rect(rect, 4.0 * zoom);
+        match task {
+            Task::Open => {
+                snapshot.append_border(&outline, &[1.5 * zoom; 4], &[tint(&ink, 0.55); 4]);
+            }
+            Task::Done(_) => {
+                let accent = (*self.imp().accent.borrow()).unwrap_or(ink);
+                snapshot.push_rounded_clip(&outline);
+                snapshot.append_color(&accent, &rect);
+                snapshot.pop();
+                let builder = gsk::PathBuilder::new();
+                let (x, y) = (rect.x(), rect.y());
+                builder.move_to(x + size * 0.26, y + size * 0.52);
+                builder.line_to(x + size * 0.43, y + size * 0.69);
+                builder.line_to(x + size * 0.75, y + size * 0.34);
+                let stroke = gsk::Stroke::new(1.8 * zoom);
+                stroke.set_line_cap(gsk::LineCap::Round);
+                stroke.set_line_join(gsk::LineJoin::Round);
+                snapshot.append_stroke(&builder.to_path(), &stroke, &ink);
+            }
+        }
+    }
+
+    /// Quotes: a bar per level down their left side (in an alert's colour,
+    /// with its icon by the title); rules across.
+    fn draw_quotes(&self, snapshot: &gtk::Snapshot) {
+        let kinds = self.imp().kinds.borrow();
+        let blocks = self.imp().blocks.borrow();
+        let quoted = |n: usize| match (kinds.get(n), blocks.get(n)) {
+            (Some(LineKind::Quote { depth, .. }), _) | (_, Some(Block::Quote { depth })) => *depth,
+            _ => 0,
+        };
+        let has_quotes = kinds.iter().any(|k| matches!(k, LineKind::Quote { .. }));
+        let has_blocks = blocks
+            .iter()
+            .any(|b| matches!(b, Block::Quote { .. } | Block::Rule));
+        if !has_quotes && !has_blocks {
+            return;
+        }
+        let zoom = self.zoom();
+        let ink = self.color();
+        let width = self.width() as f32;
+        let visible = self.visible_rect();
+        let buffer = self.buffer();
+        let cursor = buffer.iter_at_mark(&buffer.get_insert()).line() as usize;
+        let (mut iter, _) = self.line_at_y(visible.y());
+        loop {
+            let (y, h) = self.line_yrange(&iter);
+            if y > visible.y() + visible.height() {
+                break;
+            }
+            let n = iter.line() as usize;
+            let (y, h) = (y as f32, h as f32);
+            let depth = quoted(n);
+            if depth > 0 {
+                let shape = self.shape(n);
+                let gap = (QUOTE_GAP as f32 * zoom).round();
+                let top = if shape.quote_first { y + gap } else { y };
+                let bottom = if shape.quote_last { y + h - gap } else { y + h };
+                let color = shape.alert.map_or(tint(&ink, 0.22), alert_color);
+                let round = graphene::Size::new(1.5 * zoom, 1.5 * zoom);
+                let square = graphene::Size::zero();
+                let (t, b) = (
+                    if shape.quote_first { round } else { square },
+                    if shape.quote_last { round } else { square },
+                );
+                for level in 0..depth {
+                    let x = (QUOTE_INDENT as f32 * level as f32 + 1.0) * zoom;
+                    let rect = graphene::Rect::new(x, top, 3.0 * zoom, bottom - top);
+                    snapshot.push_rounded_clip(&gsk::RoundedRect::new(rect, t, t, b, b));
+                    snapshot.append_color(&color, &rect);
+                    snapshot.pop();
+                }
+                // an alert's icon, before its title
+                if let Some(alert) = shape.alert
+                    && shape.quote_first
+                    && matches!(kinds.get(n), Some(LineKind::Quote { .. }))
+                {
+                    let rect = self.cursor_locations(Some(&iter)).0;
+                    let size = 15.0 * zoom;
+                    let x = (QUOTE_INDENT as f32 + 1.0) * zoom;
+                    let cy = rect.y() as f32 + rect.height() as f32 / 2.0;
+                    let stroke = gsk::Stroke::new(2.0);
+                    stroke.set_line_cap(gsk::LineCap::Round);
+                    stroke.set_line_join(gsk::LineJoin::Round);
+                    snapshot.save();
+                    snapshot.translate(&graphene::Point::new(x, cy - size / 2.0));
+                    snapshot.scale(size / 24.0, size / 24.0);
+                    for path in theme::icon_paths(alert_icon(alert)) {
+                        snapshot.append_stroke(&path, &stroke, &alert_color(alert));
+                    }
+                    snapshot.restore();
+                }
+            }
+            // a rule, unless the cursor is on it (then its dashes show)
+            if blocks.get(n) == Some(&Block::Rule) && n != cursor {
+                let thick = (2.0 * zoom).round().max(1.0);
+                let rect =
+                    graphene::Rect::new(0.0, (y + h / 2.0 - thick / 2.0).round(), width, thick);
+                snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(rect, thick / 2.0));
+                snapshot.append_color(&tint(&ink, 0.18), &rect);
+                snapshot.pop();
+            }
+            let line = iter.line();
+            iter.forward_line();
+            if iter.line() == line {
+                break;
+            }
+        }
+    }
+
+    /// Highlights (`==x==`, `<mark>`): a stroke of the accent behind the
+    /// lower part of the text, like a highlighter pen.
+    fn draw_marks(&self, snapshot: &gtk::Snapshot) {
+        let Some(accent) = *self.imp().accent.borrow() else {
+            return;
+        };
+        let zoom = self.zoom();
+        for (a, b) in self.tag_ranges("mark") {
+            for (x1, x2, glyphs) in self.range_rects(&a, &b) {
+                let (y, height) = self.glyph_box(&glyphs);
+                let top = y + height * 0.42;
+                let rect = graphene::Rect::new(
+                    x1 - 1.0 * zoom,
+                    top,
+                    x2 - x1 + 2.0 * zoom,
+                    y + height - top + 1.0 * zoom,
+                );
+                snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(rect, 3.0 * zoom));
+                snapshot.append_color(&accent, &rect);
+                snapshot.pop();
+            }
+        }
+    }
+
+    /// Pictures under the lines that show them, in the room left there.
+    fn draw_pictures(&self, snapshot: &gtk::Snapshot) {
+        let lines: Vec<usize> = {
+            let ranges = self.tag_ranges("picture");
+            let mut lines: Vec<usize> = ranges.iter().map(|(a, _)| a.line() as usize).collect();
+            lines.dedup();
+            lines
+        };
+        if lines.is_empty() {
+            return;
+        }
+        let pictures = self.imp().pictures.borrow();
+        let Some(pictures_of) = pictures.as_ref() else {
+            return;
+        };
+        let zoom = self.zoom();
+        let gap = (PICTURE_GAP as f32 * zoom).round();
+        let ink = self.color();
+        for n in lines {
+            let shown = pictures_of(n);
+            let Some(start) = self.buffer().iter_at_line(n as i32) else {
+                continue;
+            };
+            let (y, h) = self.line_yrange(&start);
+            let total: f32 = shown.iter().map(|(_, _, h)| h + gap).sum::<f32>() + gap;
+            let x = self.cursor_locations(Some(&start)).0.x() as f32;
+            let mut top = (y + h) as f32 - total + gap;
+            for (texture, w, h) in shown {
+                let rect = graphene::Rect::new(x, top, w, h);
+                let outline = gsk::RoundedRect::from_rect(rect, 8.0 * zoom);
+                snapshot.push_rounded_clip(&outline);
+                snapshot.append_scaled_texture(&texture, gsk::ScalingFilter::Trilinear, &rect);
+                snapshot.pop();
+                snapshot.append_border(&outline, &[1.0; 4], &[tint(&ink, 0.1); 4]);
+                top += h + gap;
+            }
+        }
+    }
+
+    /// `:shortcode:` emoji, in the room their first colon was given.
+    fn draw_emoji(&self, snapshot: &gtk::Snapshot) {
+        let buffer = self.buffer();
+        for (a, _) in self.tag_ranges("emoji") {
+            let mut close = a;
+            close.forward_char();
+            if !close.forward_find_char(|c| c == ':', None) {
+                continue;
+            }
+            let mut name_start = a;
+            name_start.forward_char();
+            let name = buffer.text(&name_start, &close, true);
+            let Some(emoji) = markdown::emoji(&name) else {
+                continue;
+            };
+            // where the colon is, measured by the cursor (see `range_rects`)
+            let rect = self.cursor_locations(Some(&a)).0;
+            let layout = self.create_pango_layout(Some(emoji));
+            let (_, logical) = layout.pixel_extents();
+            let y = rect.y() as f32 + (rect.height() - logical.height()) as f32 / 2.0;
+            snapshot.save();
+            snapshot.translate(&graphene::Point::new(rect.x() as f32 + self.zoom(), y));
+            snapshot.append_layout(&layout, &self.color());
+            snapshot.restore();
+        }
+    }
 }
 
-/// `next` goes on the code block or table `prev` is in.
-fn continues(prev: Block, next: Block) -> bool {
-    (prev.is_code() && next.is_code() && next != Block::FenceOpen && prev != Block::FenceClose)
-        || (prev.is_table()
-            && next.is_table()
-            && next != Block::TableHead
-            && prev != Block::TableEnd)
-}
+use markdown::continues;
 
 /// Whether `tag` is on any of `[start, end)`.
 fn has_tag_in(start: &gtk::TextIter, end: &gtk::TextIter, tag: &gtk::TextTag) -> bool {
@@ -609,24 +905,43 @@ struct Tags {
     bold: gtk::TextTag,
     italic: gtk::TextTag,
     underline: gtk::TextTag,
+    strike: gtk::TextTag,
     raw: gtk::TextTag,
     escaped: gtk::TextTag,
     italic_us: gtk::TextTag,
     bold_us: gtk::TextTag,
-    h1: gtk::TextTag,
-    h2: gtk::TextTag,
+    /// `#` to `######`.
+    headings: [gtk::TextTag; 6],
     list_start: gtk::TextTag,
     levels: Vec<gtk::TextTag>,
+    /// A ticked task: faded.
+    done: gtk::TextTag,
+    /// Quotes: indented a step per level, faded (not an alert's), with room
+    /// above and below; an alert's title makes room for its icon.
+    quote_levels: Vec<gtk::TextTag>,
+    quote_text: gtk::TextTag,
+    quote_first: gtk::TextTag,
+    quote_last: gtk::TextTag,
+    alert_title: gtk::TextTag,
     // code blocks and tables, whole lines
     mono_block: gtk::TextTag,
     code_line: gtk::TextTag,
     fence_open: gtk::TextTag,
     fence_close: gtk::TextTag,
+    /// The first and last line of indented code: its box's padding.
+    indent_first: gtk::TextTag,
+    indent_last: gtk::TextTag,
     table_line: gtk::TextTag,
     table_first: gtk::TextTag,
     table_last: gtk::TextTag,
     table_head: gtk::TextTag,
     table_rule: gtk::TextTag,
+    /// Display math, serif and centred; on one line it gets the box's
+    /// padding too.
+    math_block: gtk::TextTag,
+    math_line: gtk::TextTag,
+    /// The `===` under a heading: small, like a fence.
+    setext_rule: gtk::TextTag,
     // inside a line: code spans, keys, links and their syntax
     mono: gtk::TextTag,
     mono_h1: gtk::TextTag,
@@ -635,6 +950,27 @@ struct Tags {
     code_box: gtk::TextTag,
     kbd_box: gtk::TextTag,
     link: gtk::TextTag,
+    /// Formatting written out in raw text (a table cell, HTML): drawn, but
+    /// not the line's own formatting (`bold` and the rest are saved).
+    deco_bold: gtk::TextTag,
+    deco_italic: gtk::TextTag,
+    deco_strike: gtk::TextTag,
+    deco_underline: gtk::TextTag,
+    /// `==marked==`: drawn behind (see `draw_marks`).
+    mark: gtk::TextTag,
+    sup: gtk::TextTag,
+    sub: gtk::TextTag,
+    /// `$math$`: serif, like a formula.
+    math: gtk::TextTag,
+    /// A footnote reference: raised; a footnote's own line is smaller.
+    footnote: gtk::TextTag,
+    footnote_line: gtk::TextTag,
+    /// `<!-- comments -->`: faint italic.
+    comment: gtk::TextTag,
+    /// An alert's title (`[!NOTE]` reads NOTE), one per alert colour.
+    alert_labels: [gtk::TextTag; 5],
+    /// A line showing pictures: what to draw is found by this tag.
+    picture: gtk::TextTag,
     /// Markdown syntax on show: faint.
     syntax: gtk::TextTag,
     /// Syntax kept as a sliver of empty space: the padding of a pill.
@@ -644,9 +980,18 @@ struct Tags {
     /// Syntax that is not drawn but keeps its room (a lined-up table's
     /// pipes, whose lines are drawn instead).
     ghost: gtk::TextTag,
+    /// The first colon of an emoji's `:code:`: unseen, as wide as the
+    /// emoji drawn there.
+    emoji: gtk::TextTag,
     /// On every line `decorate_line` put something on: lines without it
     /// have nothing to take off.
     decorated: gtk::TextTag,
+    /// Made when first needed: numbered items' margins by (level, digits),
+    /// and the room under a line for its pictures by height.
+    table: gtk::TextTagTable,
+    numbers: RefCell<HashMap<(usize, u8), gtk::TextTag>>,
+    picture_room: RefCell<HashMap<i32, gtk::TextTag>>,
+    zoom: Cell<f64>,
 }
 
 impl Tags {
@@ -656,23 +1001,34 @@ impl Tags {
             tag
         };
         let plain = |name: &str| add(gtk::TextTag::builder().name(name).build());
+        let heading = |level: usize, size: f64, weight: i32| {
+            add(gtk::TextTag::builder()
+                .name(format!("h{level}"))
+                .scale(size / 15.0)
+                .weight(weight)
+                .build())
+        };
         let tags = Tags {
             body: add(gtk::TextTag::builder()
                 .name("body")
                 .line_height(LINE_HEIGHT as f32)
                 .build()),
-            h1: add(gtk::TextTag::builder()
-                .name("h1")
-                .scale(20.0 / 15.0)
-                .weight(500)
-                .build()),
-            h2: add(gtk::TextTag::builder()
-                .name("h2")
-                .scale(17.0 / 15.0)
-                .weight(500)
-                .build()),
+            headings: [
+                heading(1, 20.0, 500),
+                heading(2, 17.0, 500),
+                heading(3, 16.0, 600),
+                heading(4, 15.0, 600),
+                heading(5, 14.0, 600),
+                heading(6, 13.0, 600),
+            ],
             list_start: plain("list-start"),
             levels: (0..LEVELS).map(|i| plain(&format!("level-{i}"))).collect(),
+            done: plain("done"),
+            quote_levels: (0..LEVELS).map(|i| plain(&format!("quote-{i}"))).collect(),
+            quote_text: plain("quote-text"),
+            quote_first: plain("quote-first"),
+            quote_last: plain("quote-last"),
+            alert_title: plain("alert-title"),
             bold: add(gtk::TextTag::builder().name("bold").weight(500).build()),
             italic: add(gtk::TextTag::builder()
                 .name("italic")
@@ -681,6 +1037,10 @@ impl Tags {
             underline: add(gtk::TextTag::builder()
                 .name("underline")
                 .underline(pango::Underline::Single)
+                .build()),
+            strike: add(gtk::TextTag::builder()
+                .name("strike")
+                .strikethrough(true)
                 .build()),
             raw: plain("raw"),
             escaped: plain("escaped"),
@@ -705,6 +1065,8 @@ impl Tags {
                 .name("fence-close")
                 .scale(MONO_SCALE * 0.75)
                 .build()),
+            indent_first: plain("indent-first"),
+            indent_last: plain("indent-last"),
             table_head: add(gtk::TextTag::builder()
                 .name("table-head")
                 .weight(700)
@@ -715,6 +1077,18 @@ impl Tags {
                 .scale(MONO_SCALE * 0.5)
                 .pixels_above_lines(0)
                 .pixels_below_lines(0)
+                .build()),
+            // upright: in italics a backslash leans into a bar
+            math_block: add(gtk::TextTag::builder()
+                .name("math-block")
+                .family("serif")
+                .scale(16.0 / 15.0)
+                .justification(gtk::Justification::Center)
+                .build()),
+            math_line: plain("math-line"),
+            setext_rule: add(gtk::TextTag::builder()
+                .name("setext-rule")
+                .scale(MONO_SCALE * 0.75)
                 .build()),
             mono: add(gtk::TextTag::builder()
                 .name("mono")
@@ -739,6 +1113,55 @@ impl Tags {
             code_box: plain("code-box"),
             kbd_box: plain("kbd-box"),
             link: plain("link"),
+            deco_bold: add(gtk::TextTag::builder()
+                .name("deco-bold")
+                .weight(500)
+                .build()),
+            deco_italic: add(gtk::TextTag::builder()
+                .name("deco-italic")
+                .style(pango::Style::Italic)
+                .build()),
+            deco_strike: add(gtk::TextTag::builder()
+                .name("deco-strike")
+                .strikethrough(true)
+                .build()),
+            deco_underline: add(gtk::TextTag::builder()
+                .name("deco-underline")
+                .underline(pango::Underline::Single)
+                .build()),
+            mark: plain("mark"),
+            sup: add(gtk::TextTag::builder().name("sup").scale(0.72).build()),
+            sub: add(gtk::TextTag::builder().name("sub").scale(0.72).build()),
+            math: add(gtk::TextTag::builder()
+                .name("math")
+                .family("serif")
+                .scale(16.0 / 15.0)
+                .build()),
+            footnote: add(gtk::TextTag::builder().name("footnote").weight(600).build()),
+            footnote_line: add(gtk::TextTag::builder()
+                .name("footnote-line")
+                .scale(13.0 / 15.0)
+                .build()),
+            comment: add(gtk::TextTag::builder()
+                .name("comment")
+                .style(pango::Style::Italic)
+                .build()),
+            alert_labels: [
+                Alert::Note,
+                Alert::Tip,
+                Alert::Important,
+                Alert::Warning,
+                Alert::Caution,
+            ]
+            .map(|alert| {
+                add(gtk::TextTag::builder()
+                    .name(format!("alert-{alert:?}").to_lowercase())
+                    .weight(600)
+                    .scale(13.0 / 15.0)
+                    .foreground_rgba(&alert_color(alert))
+                    .build())
+            }),
+            picture: plain("picture"),
             syntax: plain("syntax"),
             pad: add(gtk::TextTag::builder()
                 .name("pad")
@@ -755,21 +1178,45 @@ impl Tags {
                 .name("ghost")
                 .foreground_rgba(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.001))
                 .build()),
+            emoji: add(gtk::TextTag::builder()
+                .name("emoji")
+                .foreground_rgba(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.001))
+                .build()),
             decorated: plain("decorated"),
+            table: table.clone(),
+            numbers: RefCell::new(HashMap::new()),
+            picture_room: RefCell::new(HashMap::new()),
+            zoom: Cell::new(1.0),
         };
         tags.set_zoom(1.0);
         tags
     }
 
     fn set_zoom(&self, zoom: f64) {
+        self.zoom.set(zoom);
         let px = |v: f64| (v * zoom).round() as i32;
-        self.h1.set_pixels_below_lines(px(26.0));
-        self.h2.set_pixels_above_lines(px(10.0));
-        self.h2.set_pixels_below_lines(px(4.0));
+        let [h1, h2, h3, h4, h5, h6] = &self.headings;
+        h1.set_pixels_below_lines(px(26.0));
+        h2.set_pixels_above_lines(px(10.0));
+        h2.set_pixels_below_lines(px(4.0));
+        for tag in [h3, h4, h5, h6] {
+            tag.set_pixels_above_lines(px(8.0));
+            tag.set_pixels_below_lines(px(2.0));
+        }
         self.list_start.set_pixels_above_lines(px(4.0));
         for (i, tag) in self.levels.iter().enumerate() {
             tag.set_left_margin(px(20.0 * (i + 1) as f64));
         }
+        for ((level, digits), tag) in self.numbers.borrow().iter() {
+            tag.set_left_margin(number_margin(*level, *digits, zoom).round() as i32);
+        }
+        for (i, tag) in self.quote_levels.iter().enumerate() {
+            tag.set_left_margin(px(QUOTE_INDENT * (i + 1) as f64));
+        }
+        self.quote_first.set_pixels_above_lines(px(QUOTE_GAP + 2.0));
+        self.quote_last.set_pixels_below_lines(px(QUOTE_GAP + 2.0));
+        // the icon goes where the quote's text starts
+        self.alert_title.set_left_margin(px(QUOTE_INDENT + 23.0));
         self.code_line.set_left_margin(px(14.0));
         self.code_line.set_right_margin(px(14.0));
         self.table_line.set_right_margin(px(4.0));
@@ -777,24 +1224,87 @@ impl Tags {
             .set_pixels_above_lines(px(BLOCK_GAP + CODE_PAD));
         self.fence_close
             .set_pixels_below_lines(px(BLOCK_GAP + CODE_PAD));
+        // as far into the box as a fenced block's first line
+        self.indent_first
+            .set_pixels_above_lines(px(BLOCK_GAP + 2.0 * CODE_PAD + 6.0));
+        self.indent_last
+            .set_pixels_below_lines(px(BLOCK_GAP + 2.0 * CODE_PAD + 6.0));
+        self.math_line
+            .set_pixels_above_lines(px(BLOCK_GAP + 2.0 * CODE_PAD + 2.0));
+        self.math_line
+            .set_pixels_below_lines(px(BLOCK_GAP + 2.0 * CODE_PAD + 2.0));
         self.table_line.set_pixels_above_lines(px(ROW_PAD));
         self.table_line.set_pixels_below_lines(px(ROW_PAD));
         self.table_first
             .set_pixels_above_lines(px(BLOCK_GAP + ROW_PAD + 2.0));
         self.table_last
             .set_pixels_below_lines(px(BLOCK_GAP + ROW_PAD + 2.0));
+        // superscript and subscript sit above and below the text
+        self.sup.set_rise(px(5.0) * pango::SCALE);
+        self.footnote.set_rise(px(5.0) * pango::SCALE);
+        self.sub.set_rise(-px(3.0) * pango::SCALE);
+        self.footnote.set_scale(0.72);
+        // an emoji is about 1.2em wide; a colon 0.25em
+        self.emoji
+            .set_letter_spacing(px(15.0 * 0.95) * pango::SCALE);
+        for tag in &self.alert_labels {
+            tag.set_letter_spacing((0.6 * zoom * pango::SCALE as f64) as i32);
+        }
     }
 
     /// Colours that follow the theme.
     fn set_ink(&self, ink: &gdk::RGBA) {
         self.syntax.set_foreground_rgba(Some(&tint(ink, 0.4)));
+        self.done.set_foreground_rgba(Some(&tint(ink, 0.5)));
+        self.quote_text.set_foreground_rgba(Some(&tint(ink, 0.78)));
+        self.footnote_line
+            .set_foreground_rgba(Some(&tint(ink, 0.8)));
+        self.comment.set_foreground_rgba(Some(&tint(ink, 0.5)));
     }
 
-    fn char_tags(&self) -> [(&gtk::TextTag, Style); 7] {
+    fn heading(&self, level: u8) -> &gtk::TextTag {
+        &self.headings[(level.clamp(1, 6) - 1) as usize]
+    }
+
+    /// The margin of a numbered item at `level` in a list whose widest
+    /// number has `digits` digits.
+    fn number_margin(&self, level: usize, digits: u8) -> gtk::TextTag {
+        self.numbers
+            .borrow_mut()
+            .entry((level, digits))
+            .or_insert_with(|| {
+                let tag = gtk::TextTag::builder()
+                    .name(format!("number-{level}-{digits}"))
+                    .left_margin(number_margin(level, digits, self.zoom.get()).round() as i32)
+                    .build();
+                self.table.add(&tag);
+                tag
+            })
+            .clone()
+    }
+
+    /// Room under a line for pictures `height` tall.
+    fn picture_room(&self, height: i32) -> gtk::TextTag {
+        self.picture_room
+            .borrow_mut()
+            .entry(height)
+            .or_insert_with(|| {
+                let tag = gtk::TextTag::builder()
+                    .name(format!("picture-room-{height}"))
+                    .pixels_below_lines(height)
+                    .build();
+                self.table.add(&tag);
+                tag
+            })
+            .clone()
+    }
+
+    fn char_tags(&self) -> [(&gtk::TextTag, Style); 8] {
         [
             (&self.bold, Style::BOLD),
             (&self.italic, Style::ITALIC),
             (&self.underline, Style::UNDERLINE),
+            (&self.strike, Style::STRIKE),
             (&self.raw, Style::RAW),
             (&self.escaped, Style::ESCAPED),
             (&self.italic_us, Style::ITALIC_US),
@@ -802,20 +1312,43 @@ impl Tags {
         ]
     }
 
-    fn line_tags(&self) -> impl Iterator<Item = &gtk::TextTag> {
-        [&self.h1, &self.h2, &self.list_start]
-            .into_iter()
+    /// Paragraph tags `apply_kind_tags` puts on (code and tables aside).
+    fn line_tags(&self) -> Vec<gtk::TextTag> {
+        let mut tags: Vec<gtk::TextTag> = self
+            .headings
+            .iter()
+            .chain([
+                &self.list_start,
+                &self.done,
+                &self.quote_text,
+                &self.quote_first,
+                &self.quote_last,
+                &self.alert_title,
+                &self.math_block,
+                &self.math_line,
+                &self.setext_rule,
+                // also on code fences, but display math's have no mono-block
+                &self.fence_open,
+                &self.fence_close,
+            ])
             .chain(self.levels.iter())
+            .chain(self.quote_levels.iter())
+            .cloned()
+            .collect();
+        tags.extend(self.numbers.borrow().values().cloned());
+        tags
     }
 
     /// Whole-line tags of code blocks and tables (see `apply_kind_tags`).
-    fn block_tags(&self) -> [&gtk::TextTag; 9] {
+    fn block_tags(&self) -> [&gtk::TextTag; 11] {
         [
             &self.table_rule,
             &self.mono_block,
             &self.code_line,
             &self.fence_open,
             &self.fence_close,
+            &self.indent_first,
+            &self.indent_last,
             &self.table_line,
             &self.table_first,
             &self.table_last,
@@ -824,8 +1357,8 @@ impl Tags {
     }
 
     /// What `decorate_line` puts on.
-    fn deco_tags(&self) -> [&gtk::TextTag; 12] {
-        [
+    fn deco_tags(&self) -> Vec<gtk::TextTag> {
+        let mut tags: Vec<gtk::TextTag> = [
             &self.decorated,
             &self.ghost,
             &self.mono,
@@ -835,10 +1368,29 @@ impl Tags {
             &self.code_box,
             &self.kbd_box,
             &self.link,
+            &self.deco_bold,
+            &self.deco_italic,
+            &self.deco_strike,
+            &self.deco_underline,
+            &self.mark,
+            &self.sup,
+            &self.sub,
+            &self.math,
+            &self.footnote,
+            &self.footnote_line,
+            &self.comment,
+            &self.picture,
             &self.syntax,
             &self.pad,
             &self.conceal,
+            &self.emoji,
         ]
+        .into_iter()
+        .chain(self.alert_labels.iter())
+        .cloned()
+        .collect();
+        tags.extend(self.picture_room.borrow().values().cloned());
+        tags
     }
 }
 
@@ -902,7 +1454,9 @@ struct State {
     toolbar_x: Option<(i32, i32, i32)>,
     writing: bool,
     save_again: bool,
-    /// Lines the cursor and selection end are on: their syntax is shown.
+    /// Lines whose syntax is shown: the cursor's and the selection end's
+    /// (`cursor_lines`), and the block they are in (`revealed`, sorted).
+    cursor_lines: Vec<usize>,
     revealed: Vec<usize>,
     /// A table is waiting to be lined up after an edit in it.
     align_pending: bool,
@@ -927,6 +1481,11 @@ struct Inner {
     callbacks: RefCell<Callbacks>,
     /// The apply-tag/remove-tag handlers that mark lines' Markdown stale.
     tag_handlers: RefCell<Vec<glib::SignalHandlerId>>,
+    /// Pictures linked from notes, by file: `None` while loading (or if
+    /// it could not be read).
+    pictures: RefCell<HashMap<PathBuf, Option<gdk::Texture>>>,
+    /// The note's link reference definitions (`[label]: url`), by label.
+    references: RefCell<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -1004,6 +1563,8 @@ impl Editor {
             state: RefCell::new(State::default()),
             callbacks: RefCell::new(Callbacks::default()),
             tag_handlers: RefCell::new(Vec::new()),
+            pictures: RefCell::new(HashMap::new()),
+            references: RefCell::new(HashMap::new()),
         }));
         editor.build_toolbar();
         editor.connect_buffer();
@@ -1011,6 +1572,15 @@ impl Editor {
         editor.connect_pointer();
         editor.connect_clipboard();
         editor.connect_links();
+        let weak = editor.downgrade();
+        editor
+            .0
+            .view
+            .imp()
+            .pictures
+            .replace(Some(Box::new(move |n| {
+                upgrade(&weak).map_or_else(Vec::new, |editor| editor.pictures(n))
+            })));
         let weak = editor.downgrade();
         back.connect_clicked(move |_| {
             if let Some(editor) = upgrade(&weak) {
@@ -1276,10 +1846,13 @@ impl Editor {
         let (start, end) = self.line_span(line);
         let buffer = &self.0.buffer;
         let tags = &self.0.tags;
-        // looking costs less than removing what is not there
-        for tag in tags.line_tags() {
-            if has_tag_in(&start, &end, tag) {
-                buffer.remove_tag(tag, &start, &end);
+        // they cover whole lines, so the ones at its start are all there
+        // are (see `after_delete` for lines joined together); looking costs
+        // less than removing what is not there
+        let line_tags = tags.line_tags();
+        for tag in start.tags() {
+            if line_tags.contains(&tag) {
+                buffer.remove_tag(&tag, &start, &end);
             }
         }
         // every code block and table line has mono-block
@@ -1292,34 +1865,70 @@ impl Editor {
         self.apply_kind_tags(line, &start, &end);
     }
 
-    /// Heading / bullet paragraph tags for one line (nothing removed first).
+    /// Heading / list / quote paragraph tags for one line (nothing removed
+    /// first).
     fn apply_kind_tags(&self, line: usize, start: &gtk::TextIter, end: &gtk::TextIter) {
         let buffer = &self.0.buffer;
         let tags = &self.0.tags;
-        match self.0.view.kind(line) {
-            LineKind::H1 => buffer.apply_tag(&tags.h1, start, end),
-            LineKind::H2 => buffer.apply_tag(&tags.h2, start, end),
-            LineKind::Bullet { indent, .. } => {
-                let level = (indent as usize / 2).min(LEVELS - 1);
-                buffer.apply_tag(&tags.levels[level], start, end);
-                let after_bullet =
-                    line > 0 && matches!(self.0.view.kind(line - 1), LineKind::Bullet { .. });
-                if !after_bullet {
+        let view = &self.0.view;
+        let kind = view.kind(line);
+        let block = view.block(line);
+        let shape = view.shape(line);
+        if let Some(level) = kind.heading_level() {
+            buffer.apply_tag(tags.heading(level), start, end);
+        }
+        match kind {
+            LineKind::Bullet { .. } | LineKind::Numbered { .. } => {
+                let level = (shape.level as usize).min(LEVELS - 1);
+                let margin = match kind {
+                    LineKind::Numbered { task: None, .. } => {
+                        tags.number_margin(level, shape.digits)
+                    }
+                    _ => tags.levels[level].clone(),
+                };
+                buffer.apply_tag(&margin, start, end);
+                if !(line > 0 && view.kind(line - 1).is_list()) {
                     buffer.apply_tag(&tags.list_start, start, end);
                 }
+                if matches!(kind.task(), Some(Task::Done(_))) {
+                    buffer.apply_tag(&tags.done, start, end);
+                }
             }
-            LineKind::Text | LineKind::Raw => {}
+            LineKind::Quote { depth, .. } => self.apply_quote_tags(depth, shape, start, end),
+            _ => {}
         }
-        let block = self.0.view.block(line);
-        if block != Block::None {
-            buffer.apply_tag(&tags.mono_block, start, end);
+        match block {
+            Block::Quote { depth } => self.apply_quote_tags(depth, shape, start, end),
+            Block::SetextText { level } => buffer.apply_tag(tags.heading(level), start, end),
+            Block::SetextRule { .. } => buffer.apply_tag(&tags.setext_rule, start, end),
+            Block::MathOpen => buffer.apply_tag(&tags.fence_open, start, end),
+            Block::MathClose => buffer.apply_tag(&tags.fence_close, start, end),
+            Block::Math => buffer.apply_tag(&tags.math_block, start, end),
+            Block::MathLine => {
+                buffer.apply_tag(&tags.math_block, start, end);
+                buffer.apply_tag(&tags.math_line, start, end);
+            }
+            _ => {}
         }
-        let tag = match block {
-            Block::None => return,
-            Block::FenceOpen | Block::Code | Block::FenceClose => &tags.code_line,
-            _ => &tags.table_line,
+        if !block.is_code() && !block.is_table() {
+            return;
+        }
+        buffer.apply_tag(&tags.mono_block, start, end);
+        let tag = if block.is_code() {
+            &tags.code_line
+        } else {
+            &tags.table_line
         };
         buffer.apply_tag(tag, start, end);
+        if let Block::Indented { first, last } = block {
+            if first {
+                buffer.apply_tag(&tags.indent_first, start, end);
+            }
+            if last {
+                buffer.apply_tag(&tags.indent_last, start, end);
+            }
+            return;
+        }
         let edge = match block {
             Block::FenceOpen => &tags.fence_open,
             Block::FenceClose => &tags.fence_close,
@@ -1334,6 +1943,36 @@ impl Editor {
         buffer.apply_tag(edge, start, end);
     }
 
+    fn apply_quote_tags(
+        &self,
+        depth: u8,
+        shape: Shape,
+        start: &gtk::TextIter,
+        end: &gtk::TextIter,
+    ) {
+        let buffer = &self.0.buffer;
+        let tags = &self.0.tags;
+        let level = (depth as usize).clamp(1, LEVELS) - 1;
+        buffer.apply_tag(&tags.quote_levels[level], start, end);
+        if shape.quote_first {
+            buffer.apply_tag(&tags.quote_first, start, end);
+        }
+        if shape.quote_last {
+            buffer.apply_tag(&tags.quote_last, start, end);
+        }
+        match shape.alert {
+            None => buffer.apply_tag(&tags.quote_text, start, end),
+            // the title line, `[!NOTE]`, makes room for the alert's icon
+            Some(_) if shape.quote_first => {
+                let line = start.line() as usize;
+                if matches!(self.0.view.kind(line), LineKind::Quote { .. }) {
+                    buffer.apply_tag(&tags.alert_title, start, end);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
     fn refresh_lines(&self, first: usize, last: usize) {
         for n in first..=(last + 1).min(self.line_count().saturating_sub(1)) {
             self.apply_line_tags(n);
@@ -1342,55 +1981,163 @@ impl Editor {
         self.0.view.queue_draw();
     }
 
-    /// Works out the code blocks and tables again; lines whose part in one
+    /// Works out the blocks and shapes again; lines whose part in one
     /// changed are redrawn.
     fn update_blocks(&self) {
+        self.update_layout(true);
+    }
+
+    /// Works out the blocks (code, tables, math, rules, quotes kept as
+    /// written) again, and, if `reshape` or a block changed, the shapes
+    /// (list nesting and numbers, quotes, alerts). Typing inside a line
+    /// mostly changes neither: see `reshapes`.
+    fn update_layout(&self, reshape: bool) {
         let count = self.line_count();
-        let fresh = {
-            let kinds = self.0.view.imp().kinds.borrow();
-            if self.plain() || !kinds.contains(&LineKind::Raw) {
-                let blocks = self.0.view.imp().blocks.borrow();
-                if blocks.len() == count && blocks.iter().all(|b| *b == Block::None) {
-                    return;
+        let view = &self.0.view;
+        let buffer = &self.0.buffer;
+        let plain = self.plain();
+        let (raw, shaped) = {
+            let kinds = view.imp().kinds.borrow();
+            (
+                !plain && kinds.contains(&LineKind::Raw),
+                !plain
+                    && kinds
+                        .iter()
+                        .any(|k| k.is_list() || matches!(k, LineKind::Quote { .. })),
+            )
+        };
+        // reference definitions are raw lines: with none left, links to
+        // them are plain text again
+        if !raw && !self.0.references.borrow().is_empty() {
+            self.0.references.borrow_mut().clear();
+            for n in 0..count {
+                if self.line_model(n).text().contains('[') {
+                    self.decorate_line(n, None);
                 }
-                vec![Block::None; count]
-            } else {
-                let buffer = &self.0.buffer;
-                let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
-                let lines = markdown::split_lines(&text);
-                let raw: Vec<Option<&str>> = (0..count)
-                    .map(|n| {
-                        (kinds.get(n) == Some(&LineKind::Raw))
-                            .then(|| lines.get(n).map_or("", |(r, _)| &text[r.clone()]))
-                    })
-                    .collect();
-                markdown::blocks(&raw)
+            }
+        }
+        // without raw lines there are no blocks: unless the shapes may have
+        // changed (or there are none to clear), there is nothing to do
+        if !raw && (!reshape || !shaped) {
+            let blocks = view.imp().blocks.borrow();
+            let shapes = view.imp().shapes.borrow();
+            let clean = blocks.len() == count
+                && shapes.len() == count
+                && blocks.iter().all(|b| *b == Block::None)
+                && (!reshape || shapes.iter().all(|s| *s == Shape::default()));
+            if clean {
+                return;
+            }
+        }
+        let kinds = view.imp().kinds.borrow().clone();
+        // the whole text once, rather than line by line, when blocks need it
+        let all = raw.then(|| buffer.text(&buffer.start_iter(), &buffer.end_iter(), true));
+        let ranges = all.as_ref().map(|t| markdown::split_lines(t));
+        let line_text = |n: usize| -> String {
+            match (&all, &ranges) {
+                (Some(text), Some(ranges)) => ranges
+                    .get(n)
+                    .map_or(String::new(), |(r, _)| text[r.clone()].to_string()),
+                _ => buffer
+                    .text(&self.line_start(n), &self.line_content_end(n), true)
+                    .to_string(),
             }
         };
+        let mut references = HashMap::new();
+        let mut bracketed = Vec::new();
+        let blocks = match (&all, &ranges) {
+            (Some(text), Some(ranges)) => {
+                let lines: Vec<(LineKind, &str)> = (0..count)
+                    .map(|n| {
+                        let line = ranges.get(n).map_or("", |(r, _)| &text[r.clone()]);
+                        (kinds.get(n).copied().unwrap_or(LineKind::Text), line)
+                    })
+                    .collect();
+                for (n, (kind, line)) in lines.iter().enumerate() {
+                    if line.contains('[') {
+                        bracketed.push(n);
+                    }
+                    if *kind == LineKind::Raw
+                        && let Some((label, url)) = markdown::reference_definition(line)
+                    {
+                        references.entry(label).or_insert(url);
+                    }
+                }
+                markdown::blocks(&lines)
+            }
+            _ => vec![Block::None; count],
+        };
+        // links to a definition that came or went look different now
+        if *self.0.references.borrow() != references {
+            self.0.references.replace(references);
+            for n in bracketed {
+                self.decorate_line(n, None);
+            }
+        }
         let mut changed = Vec::new();
         {
-            let mut blocks = self.0.view.imp().blocks.borrow_mut();
-            blocks.resize(count, Block::None);
-            for (n, block) in fresh.into_iter().enumerate() {
-                if blocks[n] != block {
-                    blocks[n] = block;
+            let mut old = view.imp().blocks.borrow_mut();
+            old.resize(count, Block::None);
+            for (n, block) in blocks.iter().enumerate() {
+                if old[n] != *block {
+                    old[n] = *block;
                     changed.push(n);
                 }
             }
         }
+        if reshape || !changed.is_empty() {
+            let shapes = if shaped || raw {
+                markdown::shapes(&kinds, &blocks, line_text)
+            } else {
+                vec![Shape::default(); count]
+            };
+            let mut old = view.imp().shapes.borrow_mut();
+            old.resize(count, Shape::default());
+            for (n, shape) in shapes.into_iter().enumerate() {
+                if old[n] != shape {
+                    old[n] = shape;
+                    changed.push(n);
+                }
+            }
+        }
+        changed.sort_unstable();
+        changed.dedup();
         for &n in &changed {
             self.apply_line_tags(n);
             self.decorate_line(n, None);
         }
         if !changed.is_empty() {
-            self.0.view.queue_draw();
+            view.queue_draw();
+        }
+    }
+
+    /// Whether an edit inside line `n` (which was `before`) can change the
+    /// shapes: they hang on the lines' kinds, on whether the other lines in
+    /// a list are blank or indented, and on a quote's first line.
+    fn reshapes(&self, n: usize, before: &Line) -> bool {
+        let kind = self.0.view.kind(n);
+        if kind != before.kind {
+            return true;
+        }
+        match kind {
+            // a quote kept as written may be an alert's title
+            LineKind::Raw if matches!(self.0.view.block(n), Block::Quote { .. }) => true,
+            LineKind::Text | LineKind::Raw => {
+                let lead = |text: &str| {
+                    let trimmed = text.trim_start();
+                    (trimmed.is_empty(), text.len() - trimmed.len())
+                };
+                lead(&before.text()) != lead(&self.line_model(n).text())
+            }
+            LineKind::Quote { .. } => true,
+            _ => false,
         }
     }
 
     /// Re-applies what is drawn inside a line: faint fences and table pipes,
-    /// code spans, keys and links. The syntax of a code span, key or link
-    /// hides unless the cursor is at it; in a table it always shows, so the
-    /// columns stay lined up. `line` is the line's model, if at hand.
+    /// code spans, keys, links, pictures and the rest. The syntax around
+    /// them hides unless the cursor is at it; in a table it always shows,
+    /// so the columns stay lined up. `line` is the line's model, if at hand.
     fn decorate_line(&self, n: usize, line: Option<&Line>) {
         self.decorate(n, line, false);
     }
@@ -1415,7 +2162,11 @@ impl Editor {
         let buffer = &self.0.buffer;
         let tags = &self.0.tags;
         let block = self.0.view.block(n);
-        let fence = matches!(block, Block::FenceOpen | Block::FenceClose);
+        let shape = self.0.view.shape(n);
+        let fence = matches!(
+            block,
+            Block::FenceOpen | Block::FenceClose | Block::MathOpen | Block::MathClose
+        );
         let faint = fence || block == Block::TableRule;
         let table = block.is_table();
         let owned;
@@ -1426,22 +2177,42 @@ impl Editor {
                 &owned
             }
         };
-        let items = if self.plain() || block == Block::Code || faint {
+        let items = if self.plain() || block.is_opaque() {
             Vec::new()
         } else {
-            markdown::inlines(&line.spans)
+            self.line_inlines(line)
         };
+        // a link reference definition: quiet, like a footnote
+        let definition =
+            line.kind == LineKind::Raw && markdown::reference_definition(&line.text()).is_some();
+        let alert_title = shape.alert.is_some()
+            && shape.quote_first
+            && matches!(line.kind, LineKind::Quote { .. });
+        let special = table
+            || faint
+            || alert_title
+            || definition
+            || matches!(
+                block,
+                Block::Indented { .. }
+                    | Block::MathLine
+                    | Block::Rule
+                    | Block::SetextRule { .. }
+                    | Block::Quote { .. }
+            );
         // (a plain text file has no blocks: nothing is faint or a table there)
-        let bare = items.is_empty() && !table && !faint;
+        let bare = items.is_empty() && !special;
         if fresh && bare {
             return;
         }
         let start = self.line_start(n);
         let end = self.line_content_end(n);
+        // (a heading's hidden === line hides its line break too)
+        let (_, span_end) = self.line_span(n);
         if !fresh && has_tag_in(&start, &end, &tags.decorated) {
             for tag in tags.deco_tags() {
-                if has_tag_in(&start, &end, tag) {
-                    buffer.remove_tag(tag, &start, &end);
+                if has_tag_in(&start, &span_end, &tag) {
+                    buffer.remove_tag(&tag, &start, &span_end);
                 }
             }
         }
@@ -1451,13 +2222,13 @@ impl Editor {
         buffer.apply_tag(&tags.decorated, &start, &end);
         // like GitHub, a code block's fences and a table's pipes only show
         // while it is being edited (a table that is not lined up keeps them)
+        let cursor_lines = self.cursor_lines();
         let editing = || {
             self.block_around(n).is_some_and(|(first, last)| {
-                self.cursor_lines()
-                    .iter()
-                    .any(|c| (first..=last).contains(c))
+                cursor_lines.iter().any(|c| (first..=last).contains(c))
             })
         };
+        let here = cursor_lines.contains(&n);
         let quiet = if fence {
             (!editing()).then_some(&tags.conceal)
         } else if table && !editing() && self.table_lined_up(n) {
@@ -1465,7 +2236,10 @@ impl Editor {
         } else {
             None
         };
-        if faint {
+        if faint || definition {
+            if definition {
+                buffer.apply_tag(&tags.footnote_line, &start, &end);
+            }
             buffer.apply_tag(quiet.unwrap_or(&tags.syntax), &start, &end);
             return;
         }
@@ -1477,10 +2251,61 @@ impl Editor {
                 buffer.apply_tag(tag, &a, &b);
             }
         };
+        let text = line.text();
+        let len = text.chars().count();
+        // a rule's dashes, a heading's ===, display math's $$ and indented
+        // code's indent show only while the cursor is there
+        let hide_or_fade = |shown: bool, from: usize, to: usize| {
+            apply(if shown { &tags.syntax } else { &tags.conceal }, from, to);
+        };
+        match block {
+            Block::Rule => {
+                hide_or_fade(here, 0, len);
+                return;
+            }
+            // the whole line, so it takes no room
+            Block::SetextRule { .. } => {
+                if editing() {
+                    apply(&tags.syntax, 0, len);
+                } else if span_end.line() as usize > n {
+                    buffer.apply_tag(&tags.conceal, &start, &span_end);
+                } else {
+                    apply(&tags.conceal, 0, len);
+                }
+                return;
+            }
+            Block::Indented { .. } => {
+                if !editing() {
+                    apply(&tags.conceal, 0, markdown::code_indent(&text).min(len));
+                }
+                return;
+            }
+            Block::MathLine => {
+                let lead = text.chars().take_while(|c| *c == ' ').count();
+                let trail = text.chars().rev().take_while(|c| c.is_whitespace()).count();
+                hide_or_fade(here, 0, lead + 2);
+                hide_or_fade(here, len - trail - 2, len);
+                return;
+            }
+            Block::Quote { .. } => {
+                let prefix = text[..markdown::quote_text(&text)].chars().count();
+                hide_or_fade(here, 0, prefix);
+            }
+            _ => {}
+        }
         if table {
-            for pipe in markdown::table_pipes(&line.text()) {
+            for pipe in markdown::table_pipes(&text) {
                 apply(quiet.unwrap_or(&tags.syntax), pipe, pipe + 1);
             }
+        }
+        // an alert's `[!NOTE]` reads NOTE, in its colour
+        if alert_title && let Some(alert) = shape.alert {
+            let open = text.find("[!").map_or(0, |b| text[..b].chars().count());
+            let close = text.rfind(']').map_or(len, |b| text[..b].chars().count());
+            let label = &tags.alert_labels[alert as usize];
+            hide_or_fade(here, open, open + 2);
+            apply(label, open + 2, close);
+            hide_or_fade(here, close, (close + 1).min(len));
         }
         let cursors: Vec<usize> = [buffer.get_insert(), buffer.selection_bound()]
             .iter()
@@ -1493,11 +2318,17 @@ impl Editor {
             LineKind::H2 => &tags.mono_h2,
             _ => &tags.mono,
         };
+        let mut pictures = false;
         for item in items {
             let (whole, text) = (item.whole.clone(), item.text.clone());
-            let shown = table
-                || text.is_empty()
-                || cursors.iter().any(|c| whole.start <= *c && *c <= whole.end);
+            let at = cursors.iter().any(|c| whole.start <= *c && *c <= whole.end);
+            let shown = table || text.is_empty() || at;
+            // the syntax around the text: faint while shown, else hidden
+            let syntax = |shown: bool| {
+                let tag = if shown { &tags.syntax } else { &tags.conceal };
+                apply(tag, whole.start, text.start.max(whole.start));
+                apply(tag, text.end.min(whole.end), whole.end);
+            };
             match item.kind {
                 InlineKind::Code | InlineKind::Kbd => {
                     let code = item.kind == InlineKind::Code;
@@ -1520,11 +2351,67 @@ impl Editor {
                 }
                 InlineKind::Link => {
                     apply(&tags.link, text.start, text.end);
-                    let tag = if shown { &tags.syntax } else { &tags.conceal };
-                    apply(tag, whole.start, text.start);
-                    apply(tag, text.end, whole.end);
+                    syntax(shown);
                 }
                 InlineKind::Url => apply(&tags.link, whole.start, whole.end),
+                InlineKind::Image => {
+                    // a picture shown under the line stands for its source;
+                    // one that cannot be shown reads as its alt text
+                    let showing = self.picture_of(&item.url).is_some();
+                    pictures |= showing;
+                    if showing && !at && !table {
+                        apply(&tags.conceal, whole.start, whole.end);
+                    } else {
+                        apply(&tags.link, text.start, text.end);
+                        syntax(at || table || text.is_empty());
+                    }
+                }
+                InlineKind::Bold
+                | InlineKind::Italic
+                | InlineKind::Strike
+                | InlineKind::Underline
+                | InlineKind::Highlight
+                | InlineKind::Sup
+                | InlineKind::Sub
+                | InlineKind::Math => {
+                    let tag = match item.kind {
+                        InlineKind::Bold => &tags.deco_bold,
+                        InlineKind::Italic => &tags.deco_italic,
+                        InlineKind::Strike => &tags.deco_strike,
+                        InlineKind::Underline => &tags.deco_underline,
+                        InlineKind::Highlight => &tags.mark,
+                        InlineKind::Sup => &tags.sup,
+                        InlineKind::Sub => &tags.sub,
+                        _ => &tags.math,
+                    };
+                    apply(tag, text.start, text.end);
+                    syntax(shown);
+                }
+                InlineKind::Footnote | InlineKind::FootnoteDef => {
+                    if item.kind == InlineKind::FootnoteDef {
+                        apply(&tags.footnote_line, 0, len);
+                    }
+                    apply(&tags.footnote, text.start, text.end);
+                    syntax(shown);
+                }
+                InlineKind::Emoji => {
+                    if !shown {
+                        apply(&tags.emoji, whole.start, whole.start + 1);
+                        apply(&tags.conceal, whole.start + 1, whole.end);
+                    }
+                }
+                InlineKind::Comment => apply(&tags.comment, whole.start, whole.end),
+                InlineKind::Tag | InlineKind::Break => apply(&tags.syntax, whole.start, whole.end),
+            }
+        }
+        // room under the line for its pictures
+        if pictures {
+            let shown = self.pictures(n);
+            if !shown.is_empty() {
+                let gap = (PICTURE_GAP * self.0.view.zoom() as f64).round() as f32;
+                let total: f32 = shown.iter().map(|(_, _, h)| h + gap).sum::<f32>() + gap;
+                apply(&tags.picture_room(total.round() as i32), 0, len);
+                apply(&tags.picture, 0, len);
             }
         }
     }
@@ -1546,21 +2433,45 @@ impl Editor {
         if self.0.state.borrow().programmatic {
             return;
         }
-        let mut lines = self.cursor_lines();
-        for line in lines.clone() {
+        let cursors = self.cursor_lines();
+        let mut lines = cursors.clone();
+        for &line in &cursors {
+            let block = self.0.view.block(line);
             match self.block_around(line) {
-                Some((first, last)) if self.0.view.block(line).is_code() => {
+                // only their fences change
+                Some((first, last))
+                    if block.is_math()
+                        || (block.is_code() && !matches!(block, Block::Indented { .. })) =>
+                {
                     lines.extend([first, last]);
                 }
                 Some((first, last)) => lines.extend(first..=last),
                 None => {}
             }
         }
-        let old = std::mem::replace(&mut self.0.state.borrow_mut().revealed, lines.clone());
-        for n in old.into_iter().filter(|n| !lines.contains(n)) {
-            self.decorate_line(n, None);
-        }
-        for n in lines {
+        lines.sort_unstable();
+        lines.dedup();
+        let (old, old_cursors) = {
+            let mut state = self.0.state.borrow_mut();
+            (
+                std::mem::replace(&mut state.revealed, lines.clone()),
+                std::mem::replace(&mut state.cursor_lines, cursors.clone()),
+            )
+        };
+        // what changed: lines coming into or out of view, and the lines
+        // the cursor was and is on (the rest of a block it stays in, say a
+        // long table, looks the same)
+        let mut redo: Vec<usize> = old
+            .iter()
+            .filter(|n| lines.binary_search(n).is_err())
+            .chain(lines.iter().filter(|n| old.binary_search(n).is_err()))
+            .chain(old_cursors.iter())
+            .chain(cursors.iter())
+            .copied()
+            .collect();
+        redo.sort_unstable();
+        redo.dedup();
+        for n in redo {
             self.decorate_line(n, None);
         }
     }
@@ -1657,10 +2568,7 @@ impl Editor {
             return;
         }
         let kind = self.0.view.kind(line);
-        let next = match kind {
-            LineKind::H1 | LineKind::H2 => LineKind::Text,
-            other => other,
-        };
+        let next = kind.next();
         {
             let mut cache = self.0.view.imp().cache.borrow_mut();
             let at = (line + 1).min(cache.len());
@@ -1669,14 +2577,46 @@ impl Editor {
             let block = blocks.get(line).copied().unwrap_or_default();
             let at = (line + 1).min(blocks.len());
             blocks.splice(at..at, std::iter::repeat_n(block, breaks));
+            let mut shapes = self.0.view.imp().shapes.borrow_mut();
+            let shape = shapes.get(line).copied().unwrap_or_default();
+            let at = (line + 1).min(shapes.len());
+            shapes.splice(at..at, std::iter::repeat_n(shape, breaks));
         }
         let mut kinds = self.0.view.imp().kinds.borrow_mut();
         let at = (line + 1).min(kinds.len());
-        if iter.line_offset() == 0 && !iter.ends_line() {
+        if programmatic {
+            // Kludd writes whole lines and sets their kinds itself: the line
+            // its text pushes down (the last one here) stays as it was
+            kinds.splice(at..at, std::iter::repeat_n(kind, breaks));
+        } else if iter.line_offset() == 0 && !iter.ends_line() {
             // Enter at the start of a line pushes it down whole: the new
-            // lines above become plain, the line keeps its kind.
-            kinds[line] = next;
-            kinds.splice(at..at, std::iter::repeat_n(next, breaks - 1).chain([kind]));
+            // lines above are empty (an empty list item, or text under a
+            // heading), the line keeps its kind and a numbered item its
+            // place in the count.
+            let above = if kind.is_list() {
+                kind.with_task(kind.task().map(|_| Task::Open))
+            } else {
+                next
+            };
+            let moved = match kind {
+                LineKind::Numbered {
+                    indent,
+                    number,
+                    delim,
+                    task,
+                } => LineKind::Numbered {
+                    indent,
+                    number: number.saturating_add(breaks as u32).min(999_999_999),
+                    delim,
+                    task,
+                },
+                other => other,
+            };
+            kinds[line] = above;
+            kinds.splice(
+                at..at,
+                std::iter::repeat_n(above, breaks - 1).chain([moved]),
+            );
         } else {
             kinds.splice(at..at, std::iter::repeat_n(next, breaks));
         }
@@ -1712,7 +2652,8 @@ impl Editor {
             }
         }
         self.refresh_lines(line, line + breaks);
-        self.update_blocks();
+        let reshape = breaks > 0 || before.len() != 1 || self.reshapes(line, &before[0]);
+        self.update_layout(reshape);
 
         let after = self.models(line, line + breaks);
         let typing = breaks == 0 && chars == 1;
@@ -1785,6 +2726,9 @@ impl Editor {
                 let mut blocks = self.0.view.imp().blocks.borrow_mut();
                 let to = (l2 + 1).min(blocks.len());
                 blocks.drain((l1 + 1).min(to)..to);
+                let mut shapes = self.0.view.imp().shapes.borrow_mut();
+                let to = (l2 + 1).min(shapes.len());
+                shapes.drain((l1 + 1).min(to)..to);
             }
             let mut kinds = self.0.view.imp().kinds.borrow_mut();
             let to = (l2 + 1).min(kinds.len());
@@ -1807,8 +2751,17 @@ impl Editor {
         let Some((line, before, cursor_before)) = pending else {
             return;
         };
+        if before.len() > 1 {
+            // the joined line still has the paragraph tags of the lines
+            // that went into it, partway along
+            let (start, end) = self.line_span(line);
+            for tag in self.0.tags.line_tags() {
+                self.0.buffer.remove_tag(&tag, &start, &end);
+            }
+        }
         self.refresh_lines(line, line);
-        self.update_blocks();
+        let reshape = before.len() != 1 || self.reshapes(line, &before[0]);
+        self.update_layout(reshape);
         let typing = before.len() == 1 && {
             let old: usize = before[0].spans.iter().map(|s| s.text.chars().count()).sum();
             let new = self.line_model(line);
@@ -1848,6 +2801,10 @@ impl Editor {
         let mut blocks = self.0.view.imp().blocks.borrow_mut();
         if blocks.len() != count {
             blocks.resize(count, Block::None);
+        }
+        let mut shapes = self.0.view.imp().shapes.borrow_mut();
+        if shapes.len() != count {
+            shapes.resize(count, Shape::default());
         }
         let mut kinds = self.0.view.imp().kinds.borrow_mut();
         if kinds.len() != count {
@@ -2114,6 +3071,7 @@ impl Editor {
         let tag = match flag {
             Style::BOLD => &self.0.tags.bold,
             Style::ITALIC => &self.0.tags.italic,
+            Style::STRIKE => &self.0.tags.strike,
             _ => &self.0.tags.underline,
         };
         // raw lines (code, tables) keep their text exactly: no formatting
@@ -2158,8 +3116,8 @@ impl Editor {
         });
     }
 
-    /// H1 / H2 / plain text for the selected lines; choosing the kind they
-    /// already have turns them back into text.
+    /// A heading or plain text for the selected lines; choosing the kind
+    /// they already have turns them back into text.
     pub fn set_line_kind(&self, kind: LineKind) {
         if self.plain() {
             return;
@@ -2181,47 +3139,117 @@ impl Editor {
     }
 
     pub fn toggle_bullets(&self) {
+        self.toggle_lines(
+            |k| matches!(k, LineKind::Bullet { task: None, .. }),
+            |k, _| LineKind::bullet(k.list_indent().unwrap_or(0)),
+        );
+    }
+
+    pub fn toggle_numbers(&self) {
+        self.toggle_lines(
+            |k| matches!(k, LineKind::Numbered { task: None, .. }),
+            |k, i| LineKind::numbered(k.list_indent().unwrap_or(0), i as u32 + 1),
+        );
+    }
+
+    pub fn toggle_tasks(&self) {
+        self.toggle_lines(
+            |k| k.task().is_some(),
+            |k, _| {
+                LineKind::bullet(k.list_indent().unwrap_or(0))
+                    .with_task(Some(k.task().unwrap_or(Task::Open)))
+            },
+        );
+    }
+
+    pub fn toggle_quote(&self) {
+        self.toggle_lines(
+            |k| matches!(k, LineKind::Quote { .. }),
+            |_, _| LineKind::quote(1),
+        );
+    }
+
+    /// Makes the selected lines `make(kind, i)`, or text again if they all
+    /// are what `is` looks for already.
+    fn toggle_lines(
+        &self,
+        is: impl Fn(LineKind) -> bool,
+        make: impl Fn(LineKind, usize) -> LineKind,
+    ) {
         if self.plain() {
             return;
         }
+        // raw lines (code, tables, quotes kept as written) stay as written:
+        // made rich, their Markdown would come alive
         let (first, last) = self.selected_lines();
-        let all = (first..=last).all(|n| matches!(self.0.view.kind(n), LineKind::Bullet { .. }));
+        let rich: Vec<usize> = (first..=last)
+            .filter(|&n| self.0.view.kind(n) != LineKind::Raw)
+            .collect();
+        if rich.is_empty() {
+            return;
+        }
+        let all = rich.iter().all(|&n| is(self.0.view.kind(n)));
         self.change(first, last, || {
-            for n in first..=last {
-                self.set_kind(
-                    n,
-                    if all {
-                        LineKind::Text
-                    } else {
-                        LineKind::bullet(0)
-                    },
-                );
+            for (i, &n) in rich.iter().enumerate() {
+                let kind = self.0.view.kind(n);
+                self.set_kind(n, if all { LineKind::Text } else { make(kind, i) });
             }
         });
     }
 
-    /// Tab / Shift+Tab on bullets. Returns false if no bullet is selected.
+    /// Tab / Shift+Tab on list items: in under the item before, or out to
+    /// the parent's level. Returns false if no list item is selected.
     fn indent_bullets(&self, delta: i32) -> bool {
         let (first, last) = self.selected_lines();
-        if !(first..=last).any(|n| matches!(self.0.view.kind(n), LineKind::Bullet { .. })) {
+        if !(first..=last).any(|n| self.0.view.kind(n).is_list()) {
             return false;
         }
         self.change(first, last, || {
             for n in first..=last {
-                if let LineKind::Bullet { indent, marker } = self.0.view.kind(n) {
-                    let indent =
-                        (indent as i32 + 2 * delta).clamp(0, 2 * (LEVELS as i32 - 1)) as u8;
-                    self.set_kind(
-                        n,
-                        LineKind::Bullet {
-                            indent: indent / 2 * 2,
-                            marker,
-                        },
-                    );
+                let kind = self.0.view.kind(n);
+                if !kind.is_list() {
+                    continue;
+                }
+                let kinds = self.0.view.imp().kinds.borrow().clone();
+                let (inside, out) = markdown::list_moves(&kinds, n);
+                let indent = if delta > 0 { inside } else { out };
+                if let Some(indent) = indent {
+                    self.set_kind(n, kind.with_indent(indent));
                 }
             }
         });
         true
+    }
+
+    /// Ticks or unticks the task on `line`.
+    fn toggle_task(&self, line: usize) {
+        let kind = self.0.view.kind(line);
+        let task = match kind.task() {
+            Some(Task::Open) => Task::Done(b'x'),
+            Some(Task::Done(_)) => Task::Open,
+            None => return,
+        };
+        self.change(line, line, || {
+            self.set_kind(line, kind.with_task(Some(task)))
+        });
+    }
+
+    /// The task box under a point of the view, as its line.
+    fn task_at(&self, x: f64, y: f64) -> Option<usize> {
+        let view = &self.0.view;
+        let (bx, by) =
+            view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+        let (iter, _) = view.line_at_y(by);
+        let line = iter.line() as usize;
+        self.0.view.kind(line).task()?;
+        let level = (view.shape(line).level as usize).min(LEVELS - 1);
+        let (left, size) = view.task_box(level);
+        let rect = view.iter_location(&iter);
+        let cy = rect.y() as f32 + rect.height() as f32 / 2.0;
+        let slack = 3.0 * view.zoom();
+        let inside = (left - slack..=left + size + slack).contains(&(bx as f32))
+            && (cy - size / 2.0 - slack..=cy + size / 2.0 + slack).contains(&(by as f32));
+        inside.then_some(line)
     }
 
     // -- code blocks and tables -----------------------------------------------------
@@ -2506,12 +3534,76 @@ impl Editor {
         true
     }
 
-    /// Enter at the end of a code block's closing fence goes back to text.
+    /// Enter after typing `$$` on a line of its own makes a block of
+    /// display math, closed already, with the cursor inside.
+    fn start_math(&self) -> bool {
+        let Some((line, cursor)) = self.cursor_line() else {
+            return false;
+        };
+        if self.plain() || self.0.view.kind(line) != LineKind::Text || !cursor.ends_line() {
+            return false;
+        }
+        if self.line_model(line).text() != "$$" {
+            return false;
+        }
+        let newline = self.newline();
+        let lines = vec![
+            markdown::raw_line("$$", newline),
+            markdown::raw_line("", newline),
+            markdown::raw_line("$$", self.line_eol(line)),
+        ];
+        let cursor_after = self.row_offset(line, &lines, 1);
+        self.rewrite(line, line, lines, cursor_after);
+        true
+    }
+
+    /// Enter after typing `---` (or `***`, `___`) on a line of its own
+    /// draws a line across, and goes on below it. Right under text, `---`
+    /// would make that text a heading: a blank line goes between.
+    fn start_rule(&self) -> bool {
+        let Some((line, cursor)) = self.cursor_line() else {
+            return false;
+        };
+        if self.plain() || self.0.view.kind(line) != LineKind::Text || !cursor.ends_line() {
+            return false;
+        }
+        let text = self.line_model(line).text();
+        if !["---", "***", "___"].contains(&text.as_str()) {
+            return false;
+        }
+        let newline = self.newline();
+        let under_text = text == "---"
+            && line > 0
+            && matches!(self.0.view.kind(line - 1), LineKind::Text | LineKind::Raw)
+            && self.0.view.block(line - 1) == Block::None
+            && !self.line_model(line - 1).text().trim().is_empty();
+        let mut lines = Vec::new();
+        if under_text {
+            lines.push(Line {
+                kind: LineKind::Text,
+                spans: Vec::new(),
+                eol: newline,
+            });
+        }
+        lines.push(markdown::raw_line(&text, newline));
+        lines.push(Line {
+            kind: LineKind::Text,
+            spans: Vec::new(),
+            eol: self.line_eol(line),
+        });
+        let cursor_after = self.row_offset(line, &lines, lines.len() - 1);
+        self.rewrite(line, line, lines, cursor_after);
+        true
+    }
+
+    /// Enter at the end of a code block's (or display math's) closing line
+    /// goes back to text.
     fn leave_code_block(&self) -> bool {
         let Some((line, cursor)) = self.cursor_line() else {
             return false;
         };
-        if self.0.view.block(line) != Block::FenceClose || !cursor.ends_line() {
+        let block = self.0.view.block(line);
+        if !matches!(block, Block::FenceClose | Block::MathClose) || !cursor.ends_line() {
             return false;
         }
         let fence = self.line_model(line);
@@ -2559,6 +3651,7 @@ impl Editor {
     // -- links ---------------------------------------------------------------------
 
     /// Ctrl+click opens a link; with Ctrl held, the pointer shows where.
+    /// A click on a task's box ticks it.
     fn connect_links(&self) {
         let click = gtk::GestureClick::builder()
             .button(gdk::BUTTON_PRIMARY)
@@ -2573,6 +3666,9 @@ impl Editor {
             if let Some(url) = editor.link_at(x, y).filter(|_| ctrl) {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 editor.open_link(&url);
+            } else if let Some(line) = editor.task_at(x, y).filter(|_| !editor.plain()) {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                editor.toggle_task(line);
             }
         });
         self.0.view.add_controller(click);
@@ -2585,7 +3681,7 @@ impl Editor {
             let ctrl = motion
                 .current_event_state()
                 .contains(gdk::ModifierType::CONTROL_MASK);
-            let over = ctrl && editor.link_at(x, y).is_some();
+            let over = (ctrl && editor.link_at(x, y).is_some()) || editor.task_at(x, y).is_some();
             if on_link.replace(over) != over {
                 let cursor = if over { "pointer" } else { "text" };
                 editor.0.view.set_cursor_from_name(Some(cursor));
@@ -2594,59 +3690,59 @@ impl Editor {
         self.0.view.add_controller(motion);
     }
 
-    /// The link under a point of the view.
+    /// The link (or picture, or footnote) under a point of the view.
     fn link_at(&self, x: f64, y: f64) -> Option<String> {
         let view = &self.0.view;
         let (bx, by) =
             view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
         let iter = view.iter_at_location(bx, by)?;
-        if !iter.has_tag(&self.0.tags.link) {
+        let tags = &self.0.tags;
+        if !iter.has_tag(&tags.link) && !iter.has_tag(&tags.footnote) {
             return None;
         }
         let offset = iter.line_offset() as usize;
-        markdown::inlines(&self.line_model(iter.line() as usize).spans)
+        let item = self
+            .line_inlines(&self.line_model(iter.line() as usize))
             .into_iter()
             .find(|i| {
-                matches!(i.kind, InlineKind::Link | InlineKind::Url) && i.text.contains(&offset)
-            })
-            .map(|i| i.url)
+                matches!(
+                    i.kind,
+                    InlineKind::Link | InlineKind::Url | InlineKind::Image | InlineKind::Footnote
+                ) && i.text.contains(&offset)
+            })?;
+        let line = self.line_model(iter.line() as usize).text();
+        Some(match item.kind {
+            InlineKind::Footnote => {
+                let label: String = line
+                    .chars()
+                    .skip(item.text.start)
+                    .take(item.text.len())
+                    .collect();
+                format!("[^{label}]")
+            }
+            _ => item.url,
+        })
     }
 
     /// Opens a web (or mail) link in its app; a link to a note next to this
-    /// one opens it in Kludd, other files in their app.
+    /// one opens it in Kludd, other files in their app. A footnote goes to
+    /// its text.
     fn open_link(&self, url: &str) {
+        if let Some(label) = url.strip_prefix("[^").and_then(|l| l.strip_suffix(']')) {
+            self.go_to_footnote(label);
+            return;
+        }
         let window = self.0.view.root().and_downcast::<gtk::Window>();
         let launch = |uri: &str| {
             gtk::UriLauncher::new(uri).launch(window.as_ref(), gio::Cancellable::NONE, |_| {});
         };
-        let scheme = url.split_once(':').is_some_and(|(s, _)| {
-            s.len() > 1
-                && s.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
-        });
-        if scheme {
+        if has_scheme(url) {
             launch(url);
             return;
         }
-        // a path: `#section` is a place in it, `%20` a space
-        let path = url.split('#').next().unwrap_or_default();
-        if path.is_empty() {
+        let Some(path) = self.linked_path(url) else {
             return;
-        }
-        let path = config::expand_tilde(&percent_decode(path));
-        let dir = {
-            let state = self.0.state.borrow();
-            let doc = state.doc.as_ref();
-            doc.and_then(|d| {
-                d.path
-                    .as_deref()
-                    .and_then(Path::parent)
-                    .map(Path::to_path_buf)
-            })
-            .or_else(|| doc.and_then(|d| d.managed.clone()))
-            .unwrap_or_else(config::home_dir)
         };
-        let path = dir.join(path);
         if !path.exists() {
             self.emit_error(format!("link not found: {}", config::tilde_path(&path)));
             return;
@@ -2671,6 +3767,127 @@ impl Editor {
         }
     }
 
+    /// The file a link without a scheme points to, next to this note:
+    /// `#section` is a place in it, `%20` a space.
+    fn linked_path(&self, url: &str) -> Option<PathBuf> {
+        let path = url.split('#').next().unwrap_or_default();
+        if path.is_empty() {
+            return None;
+        }
+        let path = config::expand_tilde(&percent_decode(path));
+        let dir = {
+            let state = self.0.state.borrow();
+            let doc = state.doc.as_ref();
+            doc.and_then(|d| {
+                d.path
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+            })
+            .or_else(|| doc.and_then(|d| d.managed.clone()))
+            .unwrap_or_else(config::home_dir)
+        };
+        Some(dir.join(path))
+    }
+
+    /// What is drawn in a line, links to the note's reference definitions
+    /// included.
+    fn line_inlines(&self, line: &Line) -> Vec<markdown::Inline> {
+        let mut items = markdown::inlines(&line.spans);
+        markdown::reference_links(&line.spans, &self.0.references.borrow(), &mut items);
+        items
+    }
+
+    /// Moves the cursor to the text of footnote `label` (`[^label]: …`).
+    fn go_to_footnote(&self, label: &str) {
+        let wanted = format!("[^{label}]:");
+        let found = (0..self.line_count())
+            .find(|&n| self.line_model(n).text().trim_start().starts_with(&wanted));
+        if let Some(n) = found {
+            let at = self.line_start(n).offset() + wanted.chars().count() as i32;
+            // after this click is done with, or GTK puts the cursor at it
+            let weak = self.downgrade();
+            glib::idle_add_local_once(move || {
+                if let Some(editor) = upgrade(&weak) {
+                    editor.place_cursor(at);
+                    editor.0.view.grab_focus();
+                }
+            });
+        }
+    }
+
+    // -- pictures ------------------------------------------------------------------
+
+    /// The picture a local image link shows, once loaded; asking for one
+    /// not loaded yet starts loading it. Web images are not fetched.
+    fn picture_of(&self, url: &str) -> Option<gdk::Texture> {
+        if url.is_empty() || has_scheme(url) {
+            return None;
+        }
+        let path = self.linked_path(url)?;
+        let state = self.0.pictures.borrow().get(&path).cloned();
+        match state {
+            Some(picture) => picture,
+            None => {
+                self.load_picture(path);
+                None
+            }
+        }
+    }
+
+    /// Reads a picture off the main thread; its lines are drawn again once
+    /// it is in.
+    fn load_picture(&self, path: PathBuf) {
+        self.0.pictures.borrow_mut().insert(path.clone(), None);
+        let weak = self.downgrade();
+        glib::spawn_future_local(async move {
+            let source = path.clone();
+            let texture = gio::spawn_blocking(move || gdk::Texture::from_filename(&source).ok())
+                .await
+                .ok()
+                .flatten();
+            let Some(editor) = upgrade(&weak) else { return };
+            if texture.is_none() {
+                return;
+            }
+            editor.0.pictures.borrow_mut().insert(path, texture);
+            for n in 0..editor.line_count() {
+                let text = editor.line_model(n).text();
+                if text.contains("![") || text.to_ascii_lowercase().contains("<img") {
+                    editor.decorate_line(n, None);
+                }
+            }
+            editor.0.view.queue_draw();
+        });
+    }
+
+    /// The pictures shown under line `n`, sized to fit the view.
+    fn pictures(&self, n: usize) -> Pictures {
+        let view = &self.0.view;
+        let zoom = view.zoom();
+        let line = self.line_model(n);
+        let margin = view.cursor_locations(Some(&self.line_start(n))).0.x() as f32;
+        let room = if view.width() > 100 {
+            view.width() as f32 - margin - 4.0 * zoom
+        } else {
+            480.0 * zoom
+        };
+        markdown::inlines(&line.spans)
+            .into_iter()
+            .filter(|i| i.kind == InlineKind::Image)
+            .filter_map(|i| self.picture_of(&i.url))
+            .map(|texture| {
+                let (w, h) = (
+                    texture.width() as f32 * zoom,
+                    texture.height() as f32 * zoom,
+                );
+                let scale = (room / w).min(280.0 * zoom / h).min(1.0);
+                let size = ((w * scale).round(), (h * scale).round());
+                (texture, size.0, size.1)
+            })
+            .collect()
+    }
+
     // -- keys --------------------------------------------------------------------
 
     fn connect_keys(&self) {
@@ -2689,11 +3906,14 @@ impl Editor {
         let mods = state & (M::CONTROL_MASK | M::SHIFT_MASK | M::ALT_MASK | M::SUPER_MASK);
         let ctrl = mods == M::CONTROL_MASK;
         let ctrl_shift = mods == M::CONTROL_MASK | M::SHIFT_MASK;
-        // hardware keycodes for the digit row, so layouts don't matter
+        // hardware keycodes for the digit row and `.`, so layouts don't matter
         const KEY_1: u32 = 10;
-        const KEY_2: u32 = 11;
+        const KEY_6: u32 = 15;
+        const KEY_7: u32 = 16;
         const KEY_8: u32 = 17;
+        const KEY_9: u32 = 18;
         const KEY_0: u32 = 19;
+        const KEY_PERIOD: u32 = 60;
 
         if ctrl {
             match key.to_lower() {
@@ -2703,8 +3923,9 @@ impl Editor {
                 gdk::Key::z => self.undo(),
                 gdk::Key::y => self.redo(),
                 _ => match code {
-                    KEY_1 => self.set_line_kind(LineKind::H1),
-                    KEY_2 => self.set_line_kind(LineKind::H2),
+                    KEY_1..=KEY_6 => {
+                        self.set_line_kind(LineKind::heading((code - KEY_1 + 1) as u8))
+                    }
                     KEY_0 => self.set_line_kind(LineKind::Text),
                     _ => return false,
                 },
@@ -2714,7 +3935,11 @@ impl Editor {
         if ctrl_shift {
             match (key.to_lower(), code) {
                 (gdk::Key::z, _) => self.redo(),
+                (gdk::Key::x, _) => self.toggle_style(Style::STRIKE),
+                (_, KEY_7) => self.toggle_numbers(),
                 (_, KEY_8) => self.toggle_bullets(),
+                (_, KEY_9) => self.toggle_tasks(),
+                (_, KEY_PERIOD) => self.toggle_quote(),
                 _ => return false,
             }
             return true;
@@ -2747,20 +3972,48 @@ impl Editor {
         Some((cursor.line() as usize, cursor))
     }
 
-    /// `- ` / `* ` start a bullet, `# ` / `## ` a heading.
+    /// What typing the start of a line and a space makes: `- ` / `* ` a
+    /// bullet, `1. ` a numbered item, `[ ] ` a task, `> ` a quote, `# ` to
+    /// `###### ` a heading; `[ ] ` on a list item gives it a box.
     fn autoformat(&self) -> bool {
         let Some((line, cursor)) = self.cursor_line() else {
             return false;
         };
-        if self.0.view.kind(line) != LineKind::Text {
-            return false;
-        }
+        let kind = self.0.view.kind(line);
         let start = self.line_start(line);
         let typed = self.0.buffer.text(&start, &cursor, true);
-        let kind = match typed.as_str() {
-            "-" | "*" => LineKind::bullet(0),
-            "#" => LineKind::H1,
-            "##" => LineKind::H2,
+        let task = match typed.as_str() {
+            "[]" | "[ ]" => Some(Task::Open),
+            "[x]" | "[X]" => Some(Task::Done(b'x')),
+            _ => None,
+        };
+        let kind = match kind {
+            LineKind::Text => match typed.as_str() {
+                "-" | "*" => LineKind::bullet(0),
+                ">" => LineKind::quote(1),
+                _ if task.is_some() => LineKind::bullet(0).with_task(task),
+                t if (1..=6).contains(&t.len()) && t.chars().all(|c| c == '#') => {
+                    LineKind::heading(t.len() as u8)
+                }
+                t => {
+                    let digits = t.len().saturating_sub(1);
+                    let number = t.get(..digits).and_then(|d| d.parse::<u32>().ok());
+                    // a leading zero would be lost (`007.` stays text)
+                    let zero = t.starts_with('0') && digits > 1;
+                    match (number, t.as_bytes().last()) {
+                        (Some(number), Some(&delim @ (b'.' | b')'))) if digits <= 9 && !zero => {
+                            LineKind::Numbered {
+                                indent: 0,
+                                number,
+                                delim,
+                                task: None,
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+            },
+            k if k.is_list() && k.task().is_none() && task.is_some() => k.with_task(task),
             _ => return false,
         };
         // the space is typed as usual first, so undoing the formatting
@@ -2776,21 +4029,24 @@ impl Editor {
         true
     }
 
-    /// Enter on an empty bullet ends the list; in a CRLF note Enter types
-    /// CRLF so the file keeps one kind of line ending. Tables and code
-    /// blocks have their own Enter (see above).
+    /// Enter on an empty list item or quote line ends it; in a CRLF note
+    /// Enter types CRLF so the file keeps one kind of line ending. Tables,
+    /// code blocks, math and rules have their own Enter (see above).
     fn enter(&self) -> bool {
         if self.table_enter()
             || self.start_table()
             || self.start_code_block()
+            || self.start_math()
+            || self.start_rule()
             || self.leave_code_block()
             || self.code_enter()
         {
             return true;
         }
         if let Some((line, cursor)) = self.cursor_line() {
-            let is_bullet = matches!(self.0.view.kind(line), LineKind::Bullet { .. });
-            if is_bullet && cursor.line_offset() == 0 && cursor.ends_line() {
+            let kind = self.0.view.kind(line);
+            let ends = kind.is_list() || matches!(kind, LineKind::Quote { .. });
+            if ends && cursor.line_offset() == 0 && cursor.ends_line() {
                 self.change(line, line, || self.set_kind(line, LineKind::Text));
                 return true;
             }
@@ -2805,8 +4061,9 @@ impl Editor {
         false
     }
 
-    /// Backspace at the start of a bullet outdents it, then turns it into
-    /// text; at the start of a heading it turns it into text.
+    /// Backspace at the start of a list item outdents it, then turns it
+    /// into text; at the start of a quote it takes a level off; at the
+    /// start of a heading it turns it into text.
     fn backspace(&self) -> bool {
         let Some((line, cursor)) = self.cursor_line() else {
             return false;
@@ -2814,19 +4071,19 @@ impl Editor {
         if cursor.line_offset() != 0 {
             return false;
         }
-        match self.0.view.kind(line) {
-            LineKind::Bullet { indent, marker } if indent >= 2 => {
-                let kind = LineKind::Bullet {
-                    indent: indent - 2,
-                    marker,
-                };
-                self.change(line, line, || self.set_kind(line, kind));
+        let kind = self.0.view.kind(line);
+        let next = match kind {
+            k if k.is_list() && k.list_indent() != Some(0) => {
+                let kinds = self.0.view.imp().kinds.borrow().clone();
+                let (_, out) = markdown::list_moves(&kinds, line);
+                k.with_indent(out.unwrap_or(0))
             }
-            LineKind::Bullet { .. } | LineKind::H1 | LineKind::H2 => {
-                self.change(line, line, || self.set_kind(line, LineKind::Text));
-            }
+            LineKind::Quote { depth, .. } if depth > 1 => LineKind::quote(depth - 1),
+            k if k.is_list() || k.heading_level().is_some() => LineKind::Text,
+            LineKind::Quote { .. } => LineKind::Text,
             _ => return false,
-        }
+        };
+        self.change(line, line, || self.set_kind(line, next));
         true
     }
 
@@ -2975,21 +4232,29 @@ impl Editor {
 
     fn build_toolbar(&self) {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        let buttons: [(&str, &str); 6] = [
-            ("B", "b"),
-            ("I", "i"),
-            ("U", "u"),
-            ("•", "dot"),
-            ("H1", "h1"),
-            ("H2", "h2"),
+        // (name, CSS class, icon instead of the name)
+        let buttons: [(&str, &str, Option<&str>); 10] = [
+            ("B", "b", None),
+            ("I", "i", None),
+            ("U", "u", None),
+            ("S", "s", None),
+            ("•", "dot", None),
+            ("1.", "num", None),
+            ("task", "icon", Some(theme::ICON_TASK)),
+            ("quote", "icon", Some(theme::ICON_QUOTE)),
+            ("H1", "h1", None),
+            ("H2", "h2", None),
         ];
-        for (label, class) in buttons {
+        for (label, class, icon) in buttons {
             let button = gtk::Button::builder()
-                .label(label)
                 .focus_on_click(false)
                 .can_focus(false)
                 .css_classes([class])
                 .build();
+            match icon {
+                Some(svg) => button.set_child(Some(&Icon::new(svg, 14))),
+                None => button.set_label(label),
+            }
             button.set_cursor_from_name(Some("pointer"));
             let weak = self.downgrade();
             button.connect_clicked(move |_| {
@@ -2998,7 +4263,11 @@ impl Editor {
                     "B" => editor.toggle_style(Style::BOLD),
                     "I" => editor.toggle_style(Style::ITALIC),
                     "U" => editor.toggle_style(Style::UNDERLINE),
+                    "S" => editor.toggle_style(Style::STRIKE),
                     "•" => editor.toggle_bullets(),
+                    "1." => editor.toggle_numbers(),
+                    "task" => editor.toggle_tasks(),
+                    "quote" => editor.toggle_quote(),
                     "H1" => editor.set_line_kind(LineKind::H1),
                     _ => editor.set_line_kind(LineKind::H2),
                 }
@@ -3034,7 +4303,11 @@ impl Editor {
                 "B" => all_chars(&tags.bold),
                 "I" => all_chars(&tags.italic),
                 "U" => all_chars(&tags.underline),
-                "•" => all_lines(&|k| matches!(k, LineKind::Bullet { .. })),
+                "S" => all_chars(&tags.strike),
+                "•" => all_lines(&|k| matches!(k, LineKind::Bullet { task: None, .. })),
+                "1." => all_lines(&|k| matches!(k, LineKind::Numbered { task: None, .. })),
+                "task" => all_lines(&|k| k.task().is_some()),
+                "quote" => all_lines(&|k| matches!(k, LineKind::Quote { .. })),
                 "H1" => all_lines(&|k| k == LineKind::H1),
                 _ => all_lines(&|k| k == LineKind::H2),
             };
@@ -3260,6 +4533,7 @@ impl Editor {
         buffer.set_text("");
         self.0.view.imp().kinds.replace(vec![LineKind::Text]);
         self.0.view.imp().blocks.replace(vec![Block::None]);
+        self.0.view.imp().shapes.replace(vec![Shape::default()]);
         self.0.view.imp().cache.replace(vec![None]);
         self.0.state.borrow_mut().programmatic = false;
         self.replace_lines(0, 1, lines);
@@ -3581,6 +4855,15 @@ fn truncate_spans(spans: &mut Vec<Span>, at: usize) {
     *spans = split_spans(spans, at).0;
 }
 
+/// A link with a scheme (`https:`, `mailto:`) rather than a path.
+fn has_scheme(url: &str) -> bool {
+    url.split_once(':').is_some_and(|(s, _)| {
+        s.len() > 1
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
+    })
+}
+
 /// `%20` and the like in a link to a file.
 fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();
@@ -3818,12 +5101,14 @@ mod tests {
         std::fs::write(&outside, readme).unwrap();
         editor.open(&outside, false).unwrap();
         assert_eq!(editor.text(), readme);
+        // (the last line goes on the numbered item: typed at its end, the
+        // `!` is bold like the word before it)
         editor.place_cursor(editor.0.buffer.char_count());
         type_text(&editor, "!");
         editor.save_sync();
         assert_eq!(
             std::fs::read_to_string(&outside).unwrap(),
-            format!("{readme}!")
+            readme.replace("**bold**", "**bold!**")
         );
         assert!(
             outside.exists() && !dir.join("readme.md").exists(),
@@ -4063,6 +5348,183 @@ mod tests {
         );
         editor.close();
 
+        // numbered lists, tasks, quotes and deeper headings: started by
+        // typing their Markdown, carried on by Enter, ended on an empty line
+        editor.new_note(&dir);
+        type_text(
+            &editor,
+            "Kinds\n1. one\ntwo\n\n[ ] milk\neggs\n\n> said\nmore\n\n### Three\nplain",
+        );
+        assert_eq!(
+            editor.text(),
+            "# Kinds\n1. one\n2. two\n- [ ] milk\n- [ ] eggs\n> said\n> more\n### Three\nplain\n"
+        );
+        // a click on the box ticks it (one undo step); ticked, it stays
+        // ticked for Enter's new item to start open
+        editor.toggle_task(3);
+        assert!(editor.text().contains("- [x] milk\n- [ ] eggs\n"));
+        assert!(editor.line_start(3).has_tag(&editor.0.tags.done));
+        editor.undo();
+        assert!(editor.text().contains("- [ ] milk\n"));
+        // Tab nests a numbered item under the one before (three spaces in,
+        // where its text starts); Shift+Tab takes it back out
+        editor.place_cursor(find(&editor, "two"));
+        assert!(editor.indent_bullets(1));
+        assert!(
+            editor.text().contains("1. one\n   2. two\n"),
+            "{}",
+            editor.text()
+        );
+        assert_eq!(editor.0.view.shape(2).level, 1);
+        assert_eq!(
+            editor.0.view.shape(2).number,
+            2,
+            "a new list counts from its first number"
+        );
+        assert!(editor.indent_bullets(-1));
+        assert!(editor.text().contains("1. one\n2. two\n"));
+        // Backspace takes a quote level off, then the quote
+        editor.place_cursor(find(&editor, "more"));
+        assert!(editor.backspace());
+        assert!(editor.text().contains("> said\nmore\n"));
+        editor.undo();
+        // the toolbar's kinds, and strikethrough
+        let at = find(&editor, "plain");
+        select(&editor, at, at + 5);
+        editor.toggle_style(Style::STRIKE);
+        editor.toggle_numbers();
+        assert!(
+            editor.text().ends_with("1. ~~plain~~\n"),
+            "{}",
+            editor.text()
+        );
+        editor.toggle_quote();
+        assert!(
+            editor.text().ends_with("> ~~plain~~\n"),
+            "{}",
+            editor.text()
+        );
+        editor.toggle_tasks();
+        assert!(
+            editor.text().ends_with("- [ ] ~~plain~~\n"),
+            "{}",
+            editor.text()
+        );
+        check_cache(&editor);
+        // --- and Enter draw a line (a blank line keeps it from making the
+        // text above a heading); $$ and Enter open display math
+        editor.place_cursor(editor.0.buffer.char_count());
+        type_text(&editor, "\n\nabove\n---\n$$\nx^2");
+        assert!(
+            editor.text().ends_with("above\n\n---\n$$\nx^2\n$$\n"),
+            "{:?}",
+            editor.text()
+        );
+        let last = editor.line_count() - 1;
+        assert_eq!(editor.0.view.block(last - 3), Block::Rule);
+        assert_eq!(editor.0.view.block(last - 1), Block::Math);
+        // joining a heading onto the line above leaves none of its look
+        let at = find(&editor, "Three");
+        editor.place_cursor(at);
+        assert!(editor.backspace(), "the heading becomes text");
+        let mut a = editor.0.buffer.iter_at_offset(at - 1);
+        let mut b = editor.0.buffer.iter_at_offset(at);
+        editor.0.buffer.delete_interactive(&mut a, &mut b, true);
+        let joined = editor.0.buffer.iter_at_offset(find(&editor, "Three") + 2);
+        assert!(!joined.has_tag(editor.0.tags.heading(3)));
+        assert!(editor.text().contains("> moreThree\n"), "{}", editor.text());
+        // it all reads back the same
+        editor.save_sync();
+        let saved = std::fs::read_to_string(dir.join("kinds.md")).unwrap();
+        assert_eq!(markdown::serialize(&markdown::parse(&saved)), saved);
+        assert_eq!(saved, editor.text());
+        editor.close();
+
+        // QA: undo, redo and paste rewrite whole lines; the line under them
+        // keeps its kind (number, tick) as it was
+        let open_text = |name: &str, text: &str| {
+            let path = temp_dir(name).join(format!("{name}.md"));
+            std::fs::write(&path, text).unwrap();
+            editor.open(&path, false).unwrap();
+        };
+        let list = "Shopping\n1. milk\n2. eggs\n\nx\n1. \n- [x] \n3) [x] \n";
+        open_text("renumber", list);
+        editor.place_cursor(find(&editor, "Shopping") + 8);
+        type_text(&editor, "!");
+        editor.undo();
+        assert_eq!(editor.text(), list);
+        editor.redo();
+        assert_eq!(editor.text(), list.replacen("Shopping", "Shopping!", 1));
+        editor.undo();
+        editor.place_cursor(find(&editor, "Shopping") + 8);
+        editor.paste(" list\nfor Friday");
+        assert!(
+            editor.text().contains("for Friday\n1. milk\n"),
+            "{}",
+            editor.text()
+        );
+        editor.undo();
+        editor.place_cursor(find(&editor, "x\n"));
+        type_text(&editor, "y");
+        editor.undo();
+        assert_eq!(
+            editor.text(),
+            list,
+            "empty items keep their number and tick"
+        );
+        // a leading zero stays text (escaped, or Markdown would count it)
+        editor.place_cursor(editor.0.buffer.char_count());
+        type_text(&editor, "\n\n007. bond");
+        let last = editor.line_count() - 1;
+        assert_eq!(editor.0.view.kind(last), LineKind::Text);
+        assert!(
+            editor.text().ends_with("\n007\\. bond\n"),
+            "{}",
+            editor.text()
+        );
+        editor.close();
+        // a quote kept as written becomes an alert (or stops being one) as
+        // its title is typed
+        open_text("alert", "> [!WARN]\n> - item\n");
+        editor.place_cursor(find(&editor, "WARN") + 4);
+        type_text(&editor, "ING");
+        assert_eq!(editor.0.view.shape(0).alert, Some(Alert::Warning));
+        type_text(&editor, "S");
+        assert_eq!(editor.0.view.shape(1).alert, None);
+        editor.close();
+        // display math broken by typing loses its fences' small type
+        open_text("fences", "$$\nx^2\n$$\n");
+        assert!(editor.line_start(0).has_tag(&editor.0.tags.fence_open));
+        editor.place_cursor(2);
+        type_text(&editor, "a");
+        assert_eq!(editor.0.view.block(0), Block::None);
+        assert!(!editor.line_start(0).has_tag(&editor.0.tags.fence_open));
+        editor.close();
+        // a space typed after a bare `>` survives saving and reopening
+        open_text("bare", "> a\n>\n> b\n");
+        editor.place_cursor(find(&editor, "a\n") + 2);
+        type_text(&editor, "  two spaces");
+        let saved = editor.text();
+        open_text("bare2", &saved);
+        assert_eq!(editor.line_model(1).text(), "  two spaces", "{saved:?}");
+        editor.close();
+
+        // what is drawn never changes the note: not on opening, nor as the
+        // cursor walks past hidden syntax (a heading's ===, footnotes)
+        {
+            let src = "# Bottom\n\nSetext title\n============\nUnder it.\n\nInline $e^{i\\pi}+1=0$ and ==marked==, :tada:\n\n![a picture](pic.png)\n\n> [!TIP]\n> Alerts.\n\n---\n\n    code\n\nHard break at the end\\\nand a footnote[^1].\n\n[^1]: The footnote's own text.\n";
+            let path = temp_dir("hidden").join("hidden.md");
+            std::fs::write(&path, src).unwrap();
+            editor.open(&path, false).unwrap();
+            assert_eq!(editor.text(), src);
+            for n in 0..editor.line_count() {
+                editor.place_cursor(editor.line_start(n).offset());
+                assert_eq!(editor.text(), src, "cursor on line {n}");
+            }
+            editor.close();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), src);
+        }
+
         // performance: a 5 000 line note
         let mut big = String::new();
         for i in 0..5_000 {
@@ -4093,6 +5555,26 @@ mod tests {
         let t = Instant::now();
         let _ = editor.text();
         let serialize = t.elapsed();
+        // moving through a long block only redraws what changes
+        let code: String = std::iter::once("text\n\n".to_string())
+            .chain((0..1500).map(|i| format!("    let x{i} = {i};\n")))
+            .collect();
+        let code_path = dir.join("code.md");
+        std::fs::write(&code_path, &code).unwrap();
+        editor.open(&code_path, true).unwrap();
+        let t = Instant::now();
+        for n in 0..50 {
+            editor.place_cursor(editor.line_start(700 + n).offset() + 6);
+        }
+        let per_move = t.elapsed() / 50;
+        eprintln!("1500 lines of indented code: per cursor move {per_move:?}");
+        assert!(
+            per_move < Duration::from_millis(20),
+            "moving too slow: {per_move:?}"
+        );
+        assert_eq!(editor.text(), code);
+        editor.close();
+        editor.open(&big_path, true).unwrap();
         eprintln!("5000 lines: open {open:?}, per keystroke {per_key:?}, serialize {serialize:?}");
         assert!(
             per_key < Duration::from_millis(4),

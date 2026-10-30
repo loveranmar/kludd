@@ -70,6 +70,32 @@ body{margin:0;padding:40px;background:#f4f2ee;font-family:'Fredoka',sans-serif;d
 .ed tr+tr td{border-top:1px solid color-mix(in srgb,var(--ink) 10%,transparent)}
 .ed tr:nth-child(even) td{background:color-mix(in srgb,var(--ink) 2.5%,transparent)}
 .ed th+th,.ed td+td{border-left:1px solid color-mix(in srgb,var(--ink) 14%,transparent)}
+
+/* Lists, tasks, quotes and the rest of Markdown. Numbers count on from a
+   list's first one and line up after the widest; a ticked task fades. A
+   quote has a 3px bar per level (an alert's in its colour, with its icon
+   and title); highlights are a highlighter stroke of the accent. Math is
+   serif (the LaTeX is shown, not typeset); pictures sit under their line. */
+.ed ol{margin:4px 0 0;padding-left:20px}
+.ed ol li::marker{color:color-mix(in srgb,var(--ink) 85%,transparent)}
+.ed ul.tasks{list-style:none;padding-left:20px;margin:0}
+.ed .task{position:relative}
+.ed .task::before{content:"";position:absolute;left:-19px;top:5px;width:10px;height:10px;border-radius:4px;border:1.5px solid color-mix(in srgb,var(--ink) 55%,transparent)}
+.ed .task.done{color:color-mix(in srgb,var(--ink) 50%,transparent)}
+.ed .task.done::before{background:var(--accent);border-color:var(--accent)}
+.ed .task.done::after{content:"";position:absolute;left:-15px;top:7px;width:3px;height:6px;border:solid var(--ink);border-width:0 1.8px 1.8px 0;transform:rotate(45deg)}
+.ed h3{font-size:16px;font-weight:600;margin:8px 0 2px}
+.ed blockquote{margin:6px 0;padding-left:16px;position:relative;color:color-mix(in srgb,var(--ink) 78%,transparent)}
+.ed blockquote::before{content:"";position:absolute;left:1px;top:0;bottom:0;width:3px;border-radius:1.5px;background:color-mix(in srgb,var(--ink) 22%,transparent)}
+.ed blockquote.alert{color:var(--ink)}
+.ed blockquote.alert::before{background:var(--alert)}
+.ed .alert-title{color:var(--alert);font-size:13px;font-weight:600;letter-spacing:.6px}
+.ed .alert-title i{font-size:15px;vertical-align:-2px;margin-right:8px}
+.ed hr{border:0;height:2px;border-radius:1px;background:color-mix(in srgb,var(--ink) 18%,transparent);margin:10px 0}
+.ed mark{color:inherit;background:linear-gradient(transparent 42%,var(--accent) 42%);border-radius:3px;padding:0 1px}
+.ed .math{font-family:serif;font-size:16px}
+.ed sup.fn{font-weight:600}
+.ed s{text-decoration-thickness:1px}
 </style>
 </head>
 <body>
@@ -130,7 +156,7 @@ body{margin:0;padding:40px;background:#f4f2ee;font-family:'Fredoka',sans-serif;d
       <div class="notch"></div>
       <div class="back"><i class="ti ti-arrow-left" style="font-size:14px;vertical-align:-2px"></i> Notes</div>
       <h1>Things to fix</h1>
-      <div class="tb"><span style="font-weight:500">B</span><span style="font-style:italic">I</span><span style="text-decoration:underline">U</span><span>•</span><span>H1</span><span>H2</span></div>
+      <div class="tb"><span style="font-weight:500">B</span><span style="font-style:italic">I</span><span style="text-decoration:underline">U</span><span style="text-decoration:line-through">S</span><span>•</span><span>1.</span><span><i class="ti ti-square-check" style="font-size:14px;vertical-align:-2px"></i></span><span><i class="ti ti-quote" style="font-size:14px;vertical-align:-2px"></i></span><span>H1</span><span>H2</span></div>
       <div>Call the <b class="sel">dentist</b> before <u>Friday</u>.</div>
       <ul><li>Buy milk</li><li>Push to GitHub</li></ul>
       <h2>Later</h2>
@@ -156,6 +182,23 @@ body{margin:0;padding:40px;background:#f4f2ee;font-family:'Fredoka',sans-serif;d
       <div class="sb"><span>~/Kludd/build-notes.md</span><span>19:39</span></div>
     </div>
     <div class="cap">Editor view: code, keys, a link, a code block and a table (cursor elsewhere, so their Markdown syntax is hidden)</div>
+  </div>
+
+  <div>
+    <div class="w ed">
+      <div class="notch"></div>
+      <div class="back"><i class="ti ti-arrow-left" style="font-size:14px;vertical-align:-2px"></i> Notes</div>
+      <h1>Trip plan</h1>
+      <ol><li>Book the train</li><li>Pack light</li></ol>
+      <ul class="tasks"><li class="task done">Passport</li><li class="task">Charger</li></ul>
+      <h3>Before we go</h3>
+      <blockquote>Travel <i>light</i>, they said.</blockquote>
+      <blockquote class="alert" style="--alert:#3B82F6"><div class="alert-title"><i class="ti ti-info-circle"></i>NOTE</div>The station opens at <mark>six</mark>.</blockquote>
+      <hr>
+      <div>About <span class="math">e^{iπ}</span> hours<sup class="fn">1</sup> away, <s>maybe</s> 🎉</div>
+      <div class="sb"><span>~/Kludd/trip-plan.md</span><span>19:39</span></div>
+    </div>
+    <div class="cap">Editor view: a numbered list, tasks (one ticked), a heading 3, a quote, a NOTE alert (warning #D08700, tip #1F9D60, important #8B5CF6, caution #E5484D), a highlight, a rule, math, a footnote, strikethrough and an emoji</div>
   </div>
 </div>
 
