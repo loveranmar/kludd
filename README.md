@@ -90,6 +90,7 @@ To open `.md` and `.txt` files with Kludd by default, run `xdg-mime default klud
 | <kbd>Esc</kbd> | Back to the notes, out of a folder, or hide Kludd |
 | <kbd>Ctrl</kbd>+<kbd>B</kbd> / <kbd>I</kbd> / <kbd>U</kbd> | Bold / italic / underline |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> | Strikethrough |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>H</kbd> | Highlight (`==text==`) |
 | <kbd>Ctrl</kbd>+<kbd>1</kbd> … <kbd>6</kbd> | Heading 1 to 6 |
 | <kbd>Ctrl</kbd>+<kbd>0</kbd> | Normal text |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>7</kbd> / <kbd>8</kbd> / <kbd>9</kbd> | Numbered list / bullet list / task list |
@@ -160,7 +161,7 @@ Kludd draws these the way GitHub shows them, but underneath they stay ordinary M
 - **Pictures** (`![alt](shot.png)`, next to the note) show under their line, rounded and sized to fit. Pictures on the web are not fetched: they read as their alt text, a link to them.
 - **Math**, `$x^2$` in a line or `$$` blocks (type `$$` and press <kbd>Enter</kbd>), is set in a serif face, display math centred in a box. The LaTeX itself is shown, not typeset.
 - **Footnotes**: a reference, `[^1]`, is raised and small; <kbd>Ctrl</kbd>+click goes to its text, `[^1]: …`, which is set small like a footnote.
-- **`==Highlights==`** get a stroke of the theme's colour, like a highlighter pen, and **`:emoji:`** codes (GitHub's, `:tada:` gives 🎉) show as the emoji.
+- **`==Highlights==`** sit on the theme's colour, a softer shade of the selection's. Select text and press the toolbar's highlighter (or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>H</kbd>) to write the `==` for you; again takes them off. **`:emoji:`** codes (GitHub's, `:tada:` gives 🎉) show as the emoji.
 - **Indented code** (four spaces in) gets a code block's box.
 - **HTML**: `<b>`, `<i>`, `<s>`, `<u>`, `<mark>`, `<sup>`, `<sub>`, `<code>`, `<a href>`, `<img src>` and `<summary>` look like what they mean; other tags and `<!-- comments -->` stay, faintly.
 
@@ -172,7 +173,7 @@ Files in an added folder are edited where they are and keep their names, so link
 
 ## License
 
-[MIT](LICENSE): use, change and share Kludd freely; just keep the copyright notice. Kludd bundles the [Fredoka](https://github.com/hafontia/Fredoka-One) font ([OFL 1.1](assets/fonts/OFL.txt)) thirteen [Tabler Icons](https://tabler.io/icons) ([MIT](assets/icons/LICENSE-tabler)) and GitHub's [emoji shortcodes](https://github.com/github/gemoji) ([MIT](assets/LICENSE-gemoji)). Contributions are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md).
+[MIT](LICENSE): use, change and share Kludd freely; just keep the copyright notice. Kludd bundles the [Fredoka](https://github.com/hafontia/Fredoka-One) font ([OFL 1.1](assets/fonts/OFL.txt)) fourteen [Tabler Icons](https://tabler.io/icons) ([MIT](assets/icons/LICENSE-tabler)) and GitHub's [emoji shortcodes](https://github.com/github/gemoji) ([MIT](assets/LICENSE-gemoji)). Contributions are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 

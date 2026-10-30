@@ -791,8 +791,8 @@ impl View {
         }
     }
 
-    /// Highlights (`==x==`, `<mark>`): a stroke of the accent behind the
-    /// lower part of the text, like a highlighter pen.
+    /// Highlights (`==x==`, `<mark>`): the accent behind the text, like
+    /// the selection but softer, so the two tell apart.
     fn draw_marks(&self, snapshot: &gtk::Snapshot) {
         let Some(accent) = *self.imp().accent.borrow() else {
             return;
@@ -801,15 +801,10 @@ impl View {
         for (a, b) in self.tag_ranges("mark") {
             for (x1, x2, glyphs) in self.range_rects(&a, &b) {
                 let (y, height) = self.glyph_box(&glyphs);
-                let top = y + height * 0.42;
-                let rect = graphene::Rect::new(
-                    x1 - 1.0 * zoom,
-                    top,
-                    x2 - x1 + 2.0 * zoom,
-                    y + height - top + 1.0 * zoom,
-                );
-                snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(rect, 3.0 * zoom));
-                snapshot.append_color(&accent, &rect);
+                let pad = 2.0 * zoom;
+                let rect = graphene::Rect::new(x1 - pad, y, x2 - x1 + 2.0 * pad, height);
+                snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(rect, 4.0 * zoom));
+                snapshot.append_color(&tint(&accent, 0.6), &rect);
                 snapshot.pop();
             }
         }
@@ -3138,6 +3133,78 @@ impl Editor {
         });
     }
 
+    /// Highlights the selection (writes `==` around it), or takes the
+    /// highlight off if it is one. A highlight stays on one line.
+    pub fn toggle_highlight(&self) {
+        if self.plain() {
+            return;
+        }
+        let buffer = &self.0.buffer;
+        let Some((start, end)) = buffer.selection_bounds() else {
+            return;
+        };
+        let n = start.line() as usize;
+        if end.line() as usize != n || self.0.view.kind(n) == LineKind::Raw {
+            return;
+        }
+        let line = self.line_model(n);
+        let (a, b) = (start.line_offset() as usize, end.line_offset() as usize);
+        let line_start = self.line_start(n).offset();
+        let (spans, selected) = match self.selected_highlight() {
+            // drop the `==` either side
+            Some(mark) => {
+                let (left, rest) = split_spans(&line.spans, mark.whole.start);
+                let (_, rest) = split_spans(&rest, mark.text.start - mark.whole.start);
+                let (middle, rest) = split_spans(&rest, mark.text.len());
+                let (_, right) = split_spans(&rest, mark.whole.end - mark.text.end);
+                let at = mark.whole.start;
+                ([left, middle, right].concat(), (at, at + mark.text.len()))
+            }
+            // `==` either side, looking like the text next to it
+            None => {
+                let (left, rest) = split_spans(&line.spans, a);
+                let (middle, right) = split_spans(&rest, b - a);
+                let look = |span: Option<&Span>| {
+                    let style = span.map_or(Style::NONE, |s| s.style);
+                    style.and(Style(
+                        Style::MARKUP.0 | Style::ITALIC_US.0 | Style::BOLD_US.0,
+                    ))
+                };
+                let open = Span::new("==", look(middle.first()));
+                let close = Span::new("==", look(middle.last()));
+                let spans = [left, vec![open], middle, vec![close], right].concat();
+                (spans, (a + 2, b + 2))
+            }
+        };
+        let new = Line {
+            spans: markdown::merge(spans),
+            ..line
+        };
+        let cursor = line_start + selected.1 as i32;
+        self.rewrite(n, n, vec![new], cursor);
+        buffer.select_range(
+            &buffer.iter_at_offset(line_start + selected.0 as i32),
+            &buffer.iter_at_offset(cursor),
+        );
+    }
+
+    /// The highlight the selection is (its text, or all of it with its
+    /// `==`), if it is one.
+    fn selected_highlight(&self) -> Option<markdown::Inline> {
+        let (start, end) = self.0.buffer.selection_bounds()?;
+        if start.line() != end.line() {
+            return None;
+        }
+        let (a, b) = (start.line_offset() as usize, end.line_offset() as usize);
+        markdown::inlines(&self.line_model(start.line() as usize).spans)
+            .into_iter()
+            .find(|i| {
+                i.kind == InlineKind::Highlight
+                    && i.whole.end - i.whole.start == i.text.len() + 4
+                    && (i.text == (a..b) || i.whole == (a..b))
+            })
+    }
+
     pub fn toggle_bullets(&self) {
         self.toggle_lines(
             |k| matches!(k, LineKind::Bullet { task: None, .. }),
@@ -3936,6 +4003,7 @@ impl Editor {
             match (key.to_lower(), code) {
                 (gdk::Key::z, _) => self.redo(),
                 (gdk::Key::x, _) => self.toggle_style(Style::STRIKE),
+                (gdk::Key::h, _) => self.toggle_highlight(),
                 (_, KEY_7) => self.toggle_numbers(),
                 (_, KEY_8) => self.toggle_bullets(),
                 (_, KEY_9) => self.toggle_tasks(),
@@ -4233,11 +4301,12 @@ impl Editor {
     fn build_toolbar(&self) {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         // (name, CSS class, icon instead of the name)
-        let buttons: [(&str, &str, Option<&str>); 10] = [
+        let buttons: [(&str, &str, Option<&str>); 11] = [
             ("B", "b", None),
             ("I", "i", None),
             ("U", "u", None),
             ("S", "s", None),
+            ("mark", "icon", Some(theme::ICON_HIGHLIGHT)),
             ("•", "dot", None),
             ("1.", "num", None),
             ("task", "icon", Some(theme::ICON_TASK)),
@@ -4264,6 +4333,7 @@ impl Editor {
                     "I" => editor.toggle_style(Style::ITALIC),
                     "U" => editor.toggle_style(Style::UNDERLINE),
                     "S" => editor.toggle_style(Style::STRIKE),
+                    "mark" => editor.toggle_highlight(),
                     "•" => editor.toggle_bullets(),
                     "1." => editor.toggle_numbers(),
                     "task" => editor.toggle_tasks(),
@@ -4304,6 +4374,7 @@ impl Editor {
                 "I" => all_chars(&tags.italic),
                 "U" => all_chars(&tags.underline),
                 "S" => all_chars(&tags.strike),
+                "mark" => self.selected_highlight().is_some(),
                 "•" => all_lines(&|k| matches!(k, LineKind::Bullet { task: None, .. })),
                 "1." => all_lines(&|k| matches!(k, LineKind::Numbered { task: None, .. })),
                 "task" => all_lines(&|k| k.task().is_some()),
@@ -5472,9 +5543,50 @@ mod tests {
             list,
             "empty items keep their number and tick"
         );
+        // the highlight button writes `==` around the selection, and takes
+        // it off again; formatting stays inside it
+        editor.place_cursor(editor.0.buffer.char_count());
+        type_text(&editor, "\n\nMake it pop");
+        let at = find(&editor, "pop");
+        select(&editor, at, at + 3);
+        editor.toggle_highlight();
+        assert!(
+            editor.text().ends_with("\nMake it ==pop==\n"),
+            "{}",
+            editor.text()
+        );
+        assert!(editor.selected_highlight().is_some(), "still selected");
+        assert!(
+            editor
+                .0
+                .buffer
+                .iter_at_offset(at + 2)
+                .has_tag(&editor.0.tags.mark)
+        );
+        editor.toggle_highlight();
+        assert!(
+            editor.text().ends_with("\nMake it pop\n"),
+            "{}",
+            editor.text()
+        );
+        select(&editor, at, at + 3);
+        editor.toggle_style(Style::BOLD);
+        editor.toggle_highlight();
+        assert!(
+            editor.text().ends_with("\nMake it **==pop==**\n"),
+            "{}",
+            editor.text()
+        );
+        editor.undo();
+        editor.undo();
+        assert!(
+            editor.text().ends_with("\nMake it pop\n"),
+            "{}",
+            editor.text()
+        );
         // a leading zero stays text (escaped, or Markdown would count it)
         editor.place_cursor(editor.0.buffer.char_count());
-        type_text(&editor, "\n\n007. bond");
+        type_text(&editor, "\n007. bond");
         let last = editor.line_count() - 1;
         assert_eq!(editor.0.view.kind(last), LineKind::Text);
         assert!(

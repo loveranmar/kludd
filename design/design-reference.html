@@ -74,7 +74,7 @@ body{margin:0;padding:40px;background:#f4f2ee;font-family:'Fredoka',sans-serif;d
 /* Lists, tasks, quotes and the rest of Markdown. Numbers count on from a
    list's first one and line up after the widest; a ticked task fades. A
    quote has a 3px bar per level (an alert's in its colour, with its icon
-   and title); highlights are a highlighter stroke of the accent. Math is
+   and title); a highlight is the accent at 60%, softer than the selection. Math is
    serif (the LaTeX is shown, not typeset); pictures sit under their line. */
 .ed ol{margin:4px 0 0;padding-left:20px}
 .ed ol li::marker{color:color-mix(in srgb,var(--ink) 85%,transparent)}
@@ -92,7 +92,7 @@ body{margin:0;padding:40px;background:#f4f2ee;font-family:'Fredoka',sans-serif;d
 .ed .alert-title{color:var(--alert);font-size:13px;font-weight:600;letter-spacing:.6px}
 .ed .alert-title i{font-size:15px;vertical-align:-2px;margin-right:8px}
 .ed hr{border:0;height:2px;border-radius:1px;background:color-mix(in srgb,var(--ink) 18%,transparent);margin:10px 0}
-.ed mark{color:inherit;background:linear-gradient(transparent 42%,var(--accent) 42%);border-radius:3px;padding:0 1px}
+.ed mark{color:inherit;background:color-mix(in srgb,var(--accent) 60%,transparent);border-radius:4px;padding:0 2px}
 .ed .math{font-family:serif;font-size:16px}
 .ed sup.fn{font-weight:600}
 .ed s{text-decoration-thickness:1px}
@@ -156,7 +156,7 @@ body{margin:0;padding:40px;background:#f4f2ee;font-family:'Fredoka',sans-serif;d
       <div class="notch"></div>
       <div class="back"><i class="ti ti-arrow-left" style="font-size:14px;vertical-align:-2px"></i> Notes</div>
       <h1>Things to fix</h1>
-      <div class="tb"><span style="font-weight:500">B</span><span style="font-style:italic">I</span><span style="text-decoration:underline">U</span><span style="text-decoration:line-through">S</span><span>•</span><span>1.</span><span><i class="ti ti-square-check" style="font-size:14px;vertical-align:-2px"></i></span><span><i class="ti ti-quote" style="font-size:14px;vertical-align:-2px"></i></span><span>H1</span><span>H2</span></div>
+      <div class="tb"><span style="font-weight:500">B</span><span style="font-style:italic">I</span><span style="text-decoration:underline">U</span><span style="text-decoration:line-through">S</span><span><i class="ti ti-highlight" style="font-size:14px;vertical-align:-2px"></i></span><span>•</span><span>1.</span><span><i class="ti ti-square-check" style="font-size:14px;vertical-align:-2px"></i></span><span><i class="ti ti-quote" style="font-size:14px;vertical-align:-2px"></i></span><span>H1</span><span>H2</span></div>
       <div>Call the <b class="sel">dentist</b> before <u>Friday</u>.</div>
       <ul><li>Buy milk</li><li>Push to GitHub</li></ul>
       <h2>Later</h2>

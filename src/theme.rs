@@ -303,6 +303,7 @@ pub const ICON_FOLDER: &str = include_str!("../assets/icons/folder.svg");
 pub const ICON_FOLDER_PLUS: &str = include_str!("../assets/icons/folder-plus.svg");
 pub const ICON_TASK: &str = include_str!("../assets/icons/square-check.svg");
 pub const ICON_QUOTE: &str = include_str!("../assets/icons/quote.svg");
+pub const ICON_HIGHLIGHT: &str = include_str!("../assets/icons/highlight.svg");
 // GitHub's alerts: note, tip, important, warning, caution
 pub const ICON_NOTE: &str = include_str!("../assets/icons/info-circle.svg");
 pub const ICON_TIP: &str = include_str!("../assets/icons/bulb.svg");
@@ -407,6 +408,7 @@ mod tests {
         for icon in [
             ICON_TASK,
             ICON_QUOTE,
+            ICON_HIGHLIGHT,
             ICON_NOTE,
             ICON_TIP,
             ICON_IMPORTANT,
