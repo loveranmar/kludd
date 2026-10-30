@@ -226,12 +226,15 @@ impl View {
     /// Right edge of the text on the display line `[line, content_end)`.
     fn text_right(&self, line: &gtk::TextIter, content_end: &gtk::TextIter) -> i32 {
         if content_end <= line {
-            return self.iter_location(line).x();
+            return self.cursor_at(line).x();
         }
-        let mut last = *content_end;
-        last.backward_char();
-        let r = self.iter_location(&last);
-        r.x() + r.width()
+        self.cursor_at(content_end).x()
+    }
+
+    /// Where the cursor would be at `iter`. Unlike `iter_location`, right
+    /// next to hidden text too (see `range_rects`).
+    fn cursor_at(&self, iter: &gtk::TextIter) -> gdk::Rectangle {
+        self.cursor_locations(Some(iter)).0
     }
 
     /// Draws the selection as rounded blocks in the theme's accent colour,
@@ -276,16 +279,16 @@ impl View {
                     content_end.forward_to_line_end();
                 }
             }
-            let loc = self.iter_location(&line);
+            let loc = self.cursor_at(&line);
             if loc.y() > bottom {
                 break;
             }
             let a = if start > line { start } else { line };
             let b = if end < next { end } else { next };
             if a < b {
-                let x1 = self.iter_location(&a).x();
+                let x1 = self.cursor_at(&a).x();
                 let mut x2 = if b < content_end {
-                    self.iter_location(&b).x()
+                    self.cursor_at(&b).x()
                 } else {
                     self.text_right(&line, &content_end)
                 };
@@ -294,7 +297,7 @@ impl View {
                     x2 += newline;
                 }
                 if x2 > x1 {
-                    let glyphs = self.iter_location(&a);
+                    let glyphs = self.cursor_at(&a);
                     let (mut y, mut height) = if single {
                         self.glyph_box(&glyphs)
                     } else {
@@ -635,7 +638,7 @@ impl View {
             if let Some(&kind) = kinds.get(n).filter(|k| k.is_list()) {
                 let shape = shapes.get(n).copied().unwrap_or_default();
                 let level = (shape.level as usize).min(LEVELS - 1);
-                let rect = self.iter_location(&iter);
+                let rect = self.cursor_at(&iter);
                 let cy = rect.y() as f32 + rect.height() as f32 / 2.0 - 0.5 * zoom;
                 let left = 20.0 * level as f32 * zoom;
                 match (kind.task(), kind) {
@@ -3311,7 +3314,7 @@ impl Editor {
         self.0.view.kind(line).task()?;
         let level = (view.shape(line).level as usize).min(LEVELS - 1);
         let (left, size) = view.task_box(level);
-        let rect = view.iter_location(&iter);
+        let rect = view.cursor_at(&iter);
         let cy = rect.y() as f32 + rect.height() as f32 / 2.0;
         let slack = 3.0 * view.zoom();
         let inside = (left - slack..=left + size + slack).contains(&(bx as f32))
@@ -4522,7 +4525,7 @@ impl Editor {
             self.0.toolbar.popdown();
             return;
         }
-        let glyphs = view.iter_location(&first);
+        let glyphs = view.cursor_at(&first);
         let (y, height) = view.glyph_box(&glyphs);
         let (x, y) =
             view.buffer_to_window_coords(gtk::TextWindowType::Widget, glyphs.x(), y as i32);
@@ -4555,7 +4558,7 @@ impl Editor {
         } else {
             // no room above (the line is at the top, maybe half scrolled
             // out): go under the end of the selection, never on top of it
-            let end_glyphs = view.iter_location(&end);
+            let end_glyphs = view.cursor_at(&end);
             let (ey, eh) = view.glyph_box(&end_glyphs);
             let (_, ey) = view.buffer_to_window_coords(gtk::TextWindowType::Widget, 0, ey as i32);
             let below = ey + eh as i32;

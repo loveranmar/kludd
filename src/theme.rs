@@ -163,7 +163,9 @@ textview.editor, textview.editor > text {
   caret-color: @ink;
   font-family: "Fredoka";
 }
-textview.editor > text selection { background-color: transparent; color: @ink; }
+/* the editor draws the selection itself; a clear colour also keeps GTK
+   from drawing selected text a second time, on top (it looks bold) */
+textview.editor > text selection { background-color: transparent; color: transparent; }
 
 /* scrollbars */
 window.kludd scrollbar { background: none; border: none; }
