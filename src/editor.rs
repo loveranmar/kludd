@@ -21,6 +21,7 @@ use gtk::{gdk, gio, glib, graphene, gsk, pango};
 
 use crate::config;
 use crate::markdown::{self, Block, Eol, InlineKind, Line, LineKind, Span, Style};
+use crate::scroll;
 use crate::storage;
 use crate::theme::{self, Icon};
 
@@ -952,6 +953,7 @@ impl Editor {
             .child(&view)
             .vexpand(true)
             .build();
+        scroll::smooth_wheel(&scroller);
 
         let back_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let back_icon = Icon::new(theme::ICON_ARROW_LEFT, 14);

@@ -9,6 +9,7 @@ use gtk::prelude::*;
 use gtk::{gdk, glib};
 
 use crate::config::{self, Folder};
+use crate::scroll;
 use crate::storage::{self, Note};
 use crate::theme::{self, Icon, THEMES};
 
@@ -139,6 +140,7 @@ impl Home {
             .child(&list)
             .vexpand(true)
             .build();
+        scroll::smooth_wheel(&scroller);
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("home");

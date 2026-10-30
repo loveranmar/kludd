@@ -5,6 +5,7 @@ mod config;
 mod editor;
 mod home;
 mod markdown;
+mod scroll;
 mod storage;
 mod theme;
 
