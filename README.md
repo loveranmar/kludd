@@ -19,13 +19,15 @@ Kludd starts once when you log in and waits in the background, so pressing <kbd>
 - **Instant** — Kludd keeps running in the background; the hotkey just shows its window
 - **Plain files** — one note is one `.md` file named after its title; no database, no index, no frontmatter
 - **Rich text, real Markdown** — bold, italic, underline, strikethrough, bullets, numbered lists, tasks you tick with a click, quotes and six levels of heading while you type, saved as normal Markdown
-- **Code blocks, tables and links** — GitHub-style code blocks, `code` and <kbd>key</kbd> pills; tables that line themselves up as you type; links that read as their text and open with <kbd>Ctrl</kbd>+click
+- **Code blocks, tables and links** — GitHub-style code blocks, `code` and <kbd>key</kbd> pills; tables that line themselves up as you type; links that read as their text and open with a click
 - **All the rest of Markdown** — pictures, rules, math, footnotes, GitHub's `[!NOTE]` alerts, `==highlights==`, `:emoji:` and inline HTML, drawn the way GitHub shows them
 - **Never mangles a note** — whatever Kludd draws stays ordinary Markdown underneath, written back byte for byte (round-trip tested)
 - **Autosave** — 400 ms after you stop typing and whenever Kludd hides, written atomically
 - **Live reload** — edit a note in nvim and Kludd picks up the change
+- **Word count** — <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> shows the note's words and characters, and can keep a small "x words" in the corner as you write
+- **Find in a note** — <kbd>Ctrl</kbd>+<kbd>F</kbd> rings every match in the note, and <kbd>Enter</kbd> walks through them, even into a link's hidden address
 - **Any `.md` or `.txt` file** — `kludd notes.md` edits a file in place, and Kludd shows up in "Open with"
-- **Folders** — add any folder, like a project's `docs/notes`, and its notes get a view of their own; new notes can start right there
+- **Folders** — add any folder, like a project's `docs/notes`, and its notes get a view of their own, with its folders that hold notes inside; new notes can start right there
 - **Plain text stays plain** — a `.txt` file shows exactly what it holds: no formatting, saved exactly as typed
 - **Six themes** — pink, yellow, mint, lavender, sky and dark, switched live from the palette button
 - **Big notes stay smooth** — in the test suite a 5 000-line note full of links and code loads in about 70 ms and a keystroke costs about 0.1 ms
@@ -86,8 +88,10 @@ To open `.md` and `.txt` files with Kludd by default, run `xdg-mime default klud
 |------|--------|
 | <kbd>Home</kbd> | Show Kludd, or hide it (the Hyprland bind above) |
 | <kbd>Ctrl</kbd>+<kbd>N</kbd> | New note (in the folder on show) |
-| <kbd>Ctrl</kbd>+<kbd>F</kbd> | Search notes (or just start typing on the notes view) |
-| <kbd>Esc</kbd> | Back to the notes, out of a folder, or hide Kludd |
+| <kbd>Ctrl</kbd>+<kbd>F</kbd> | In a note: find in it. On the notes: search them (or just start typing) |
+| <kbd>Enter</kbd> / <kbd>Shift</kbd>+<kbd>Enter</kbd> while finding | Next / previous match |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> | Word count: words and characters, and a switch to keep "x words" in the corner while you type |
+| <kbd>Esc</kbd> | Close the find bar, back to the notes, up one folder, or hide Kludd |
 | <kbd>Ctrl</kbd>+<kbd>B</kbd> / <kbd>I</kbd> / <kbd>U</kbd> | Bold / italic / underline |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> | Strikethrough |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>H</kbd> | Highlight (`==text==`) |
@@ -97,12 +101,12 @@ To open `.md` and `.txt` files with Kludd by default, run `xdg-mime default klud
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>.</kbd> | Quote |
 | <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Nest / un-nest a list item; in a table, next / previous cell |
 | <kbd>Enter</kbd> in a table | New row (on an empty last row: leave the table) |
-| <kbd>Ctrl</kbd>+click | Open a link |
+| Click | Open a link (<kbd>Ctrl</kbd>+click while editing it, when its Markdown shows) |
 | <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>-</kbd> | Zoom the editor in / out |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>0</kbd> | Reset zoom |
 | <kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> | Undo / redo (formatting included) |
 
-Typing `- ` or `* ` at the start of a line makes a bullet, `# ` and `## ` make headings, and Enter on an empty bullet ends the list. Select text to get the floating **B** *I* <u>U</u> • H1 H2 toolbar. ```` ``` ```` (or ```` ```rust ````) and <kbd>Enter</kbd> starts a code block, and a `| a | b |` line with a `|---|---|` line under it and <kbd>Enter</kbd> starts a table; see [Code blocks, tables and links](#code-blocks-tables-and-links).
+Typing `- ` or `* ` at the start of a line makes a bullet, `# ` and `## ` make headings, and Enter on an empty bullet ends the list. Select text to get the floating **B** *I* <u>U</u> • H1 H2 toolbar. ```` ``` ```` (or ```` ```rust ````) and <kbd>Enter</kbd> starts a code block, and a `| a | b |` line with a `|---|---|` line under it and <kbd>Enter</kbd> starts a table; see [Code blocks, tables, links and the rest](#code-blocks-tables-links-and-the-rest).
 
 From a terminal, `kludd` shows the running Kludd, `kludd file.md` opens a file in it, `kludd ~/code/app/notes` adds that folder and shows its notes, `kludd --toggle` shows or hides it, and `kludd --quit` saves and quits.
 
@@ -114,6 +118,7 @@ From a terminal, `kludd` shows the running Kludd, `kludd file.md` opens a file i
 notes_dir = "~/Kludd"       # where notes live
 theme = "pink"              # pink, yellow, mint, lavender, sky or dark
 zoom = 1.0                  # editor zoom, changed with Ctrl +/-
+word_count = false          # "x words" in the editor's corner (Ctrl+Shift+C)
 
 [[folders]]                 # an added folder, see Folders below
 path = "~/code/app/notes"
@@ -167,7 +172,7 @@ Kludd draws these the way GitHub shows them, but underneath they stay ordinary M
 
 ## Folders
 
-Notes that live somewhere else, like a project's `docs/notes`, can have a place in Kludd too. Press the folder button next to **+**, type the folder's path (<kbd>Tab</kbd> completes folder names) and press <kbd>Enter</kbd>, or run `kludd ~/code/app/notes`. The folder gets a card above your notes; click it to see the `.md` and `.txt` files in it (not those in its subfolders), and press **+** there to start a note in that folder. Everything else stays in `notes_dir`.
+Notes that live somewhere else, like a project's `docs/notes`, can have a place in Kludd too. Press the folder button next to **+**, type the folder's path (<kbd>Tab</kbd> completes folder names) and press <kbd>Enter</kbd>, or run `kludd ~/code/app/notes`. The folder gets a card above your notes; click it to see the `.md` and `.txt` files in it, with a card for each folder inside that has notes somewhere in it (other files and folders stay out of sight). Click one to go in, and the back button (or <kbd>Esc</kbd>) to go up again. Press **+** in any of them to start a note right there; Kludd only ever makes `.md` files. Everything else stays in `notes_dir`.
 
 Files in an added folder are edited where they are and keep their names, so links to them keep working. Only a note you start in Kludd is named after its title, while you write it. Right-click a folder card to give it a colour: each dot is one of the themes' accents, and the first one makes the card plain again. *Remove from Kludd*, in the same menu, takes the folder off the list; the folder and its files are left alone.
 

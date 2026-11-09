@@ -22,10 +22,12 @@ use gtk::subclass::prelude::*;
 use gtk::{gdk, gio, glib, graphene, gsk, pango};
 
 use crate::config;
+use crate::find;
 use crate::markdown::{
     self, Alert, Block, Eol, InlineKind, Line, LineKind, Shape, Span, Style, Task,
 };
 use crate::scroll;
+use crate::stats;
 use crate::storage;
 use crate::theme::{self, Icon};
 
@@ -42,6 +44,9 @@ const MONO_SCALE: f64 = 13.0 / 15.0;
 /// a code block above and below its fences.
 const BLOCK_GAP: f64 = 6.0;
 const CODE_PAD: f64 = 4.0;
+/// How far the wrapped part of a table row too wide for the window is
+/// indented, so it reads as the same row, inside the table's box.
+const TABLE_WRAP_INDENT: f64 = 16.0;
 /// Room above and below each table row.
 const ROW_PAD: f64 = 3.0;
 /// How far each quote level is indented, and the room above and below a
@@ -108,6 +113,18 @@ mod imp {
         pub zoom: Cell<f64>,
         /// Selection colour of the current theme.
         pub accent: RefCell<Option<gdk::RGBA>>,
+        /// Text colour of the current theme.
+        pub ink: RefCell<Option<gdk::RGBA>>,
+        /// Find in the note: the matches as `[start, end)` buffer offsets,
+        /// in order, and the one gone to.
+        pub finds: RefCell<Vec<(i32, i32)>>,
+        pub find_current: Cell<Option<usize>>,
+        /// The last line's `line_directions`, with what they came from: its
+        /// start, its text and the part of it shown.
+        pub(super) directions: RefCell<Option<(i32, String, String, super::Directions)>>,
+        /// While drawing, where the text cannot change: `line_directions`
+        /// of each line asked about, by its start.
+        pub(super) drawing: RefCell<Option<super::DrawnLines>>,
     }
 
     #[glib::object_subclass]
@@ -136,15 +153,18 @@ mod imp {
         fn snapshot_layer(&self, layer: gtk::TextViewLayer, snapshot: gtk::Snapshot) {
             if layer == gtk::TextViewLayer::BelowText {
                 let view = self.obj();
+                self.drawing.replace(Some(Vec::new()));
                 view.draw_blocks(&snapshot);
                 view.draw_quotes(&snapshot);
                 view.draw_boxes(&snapshot);
                 view.draw_marks(&snapshot);
+                view.draw_finds(&snapshot);
                 view.draw_selection(&snapshot);
                 view.draw_links(&snapshot);
                 view.draw_markers(&snapshot);
                 view.draw_pictures(&snapshot);
                 view.draw_emoji(&snapshot);
+                self.drawing.replace(None);
             }
             self.parent_snapshot_layer(layer, snapshot);
         }
@@ -228,7 +248,271 @@ impl View {
         if content_end <= line {
             return self.cursor_at(line).x();
         }
+        // a wrapped row ends where the next one starts, which GTK places
+        // at the start of that next row
+        if !content_end.ends_line() {
+            return self.row_right(line, content_end);
+        }
         self.cursor_at(content_end).x()
+    }
+
+    /// Right edge of the text on the display row starting at `row`, which
+    /// wraps at `next` (the next row's start, on the same line): measured
+    /// on the row's last shown character, as GTK's own row end can land
+    /// past `next` when hidden text (a link's `[`) starts the next row.
+    fn row_right(&self, row: &gtk::TextIter, next: &gtk::TextIter) -> i32 {
+        let hidden = |i: &gtk::TextIter| i.tags().iter().any(|t| t.is_invisible());
+        let mut last = *next;
+        loop {
+            if last <= *row || !last.backward_char() {
+                return self.cursor_at(row).x();
+            }
+            if !hidden(&last) {
+                break;
+            }
+        }
+        // a row that wraps at a space ends before it
+        if last.char().is_whitespace() {
+            return self.cursor_at(&last).x();
+        }
+        let mut after = last;
+        after.forward_char();
+        if after < *next {
+            // hidden text follows on this row: it starts where `last` ends
+            self.cursor_at(&after).x()
+        } else {
+            // wrapped inside a word: the next position is on the next row
+            self.cursor_at(&last).x() + self.iter_location(&last).width()
+        }
+    }
+
+    /// The shown characters of the display row starting at `row`, each
+    /// with its left and right edge (see `Row`); only those in `[from,
+    /// to)` (offsets) when given.
+    fn row_spans(
+        &self,
+        row: &gtk::TextIter,
+        within: Option<(i32, i32)>,
+    ) -> Vec<(gtk::TextIter, i32, i32)> {
+        let row = Row::new(self, row);
+        let shown = &row.shown;
+        let buffer = self.buffer();
+        let inside = |o: i32| within.is_none_or(|(from, to)| (from..to).contains(&o));
+        let Some(first) = shown.iter().position(|(o, _)| inside(*o)) else {
+            return Vec::new();
+        };
+        let last = shown.iter().rposition(|(o, _)| inside(*o)).unwrap_or(first);
+        // characters of one direction side by side are drawn side by side:
+        // then the first and the last give the edges of all
+        let one_way = within.is_some()
+            && shown[first..=last]
+                .iter()
+                .all(|(_, rtl)| *rtl == shown[first].1);
+        (first..=last)
+            .filter(|&i| !one_way || i == first || i == last)
+            .map(|i| {
+                let (left, right) = row.span(i);
+                (buffer.iter_at_offset(shown[i].0), left, right)
+            })
+            .collect()
+    }
+
+    /// The shown character under `x` on the display row starting at `row`.
+    fn row_char_at(&self, row: &gtk::TextIter, x: i32) -> Option<gtk::TextIter> {
+        let row = Row::new(self, row);
+        let shown = &row.shown;
+        let hit = |i: usize| {
+            let (left, right) = row.span(i);
+            (left..right).contains(&x)
+        };
+        let one_way = shown
+            .iter()
+            .all(|(_, rtl)| Some(rtl) == shown.first().map(|c| &c.1));
+        let found = if one_way && shown.len() > 8 {
+            // in order on screen: halve the row (each look costs, on a
+            // long line with much hidden text)
+            let rtl = shown[0].1;
+            let mut lo = 0;
+            let mut hi = shown.len();
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let (left, right) = row.span(mid);
+                let before_x = if rtl { left > x } else { right <= x };
+                if before_x {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            [lo.saturating_sub(1), lo, lo + 1]
+                .into_iter()
+                .filter(|&i| i < shown.len())
+                .find(|&i| hit(i))
+        } else {
+            (0..shown.len()).find(|&i| hit(i))
+        };
+        found.map(|i| self.buffer().iter_at_offset(shown[i].0))
+    }
+
+    /// Which of the shown characters of `[start, end)` (one line) read
+    /// right to left, by their offsets, and whether the line does: as
+    /// Unicode's bidi rules resolve them, roughly (Pango's own levels are
+    /// not to be had from GTK). The line takes the direction of its first
+    /// letter; spaces and marks that of the letters around them when those
+    /// agree, else the line's.
+    ///
+    /// `None` for a line all left to right (see `line_chars`).
+    fn line_directions(&self, start: &gtk::TextIter, end: &gtk::TextIter) -> Option<Directions> {
+        let chars = self.line_chars(start, end);
+        chars.any_rtl.then_some(chars)
+    }
+
+    /// The shown characters of a line (`[start, end)`), with their
+    /// directions (see `line_directions`). Kept while drawing (asked for
+    /// each find match or link on a line) and, between frames, for the last
+    /// line asked about, as long as its text and what of it is shown stay
+    /// the same.
+    fn line_chars(&self, start: &gtk::TextIter, end: &gtk::TextIter) -> Directions {
+        let drawn = |dirs: &Directions| {
+            if let Some(lines) = self.imp().drawing.borrow_mut().as_mut() {
+                lines.push((start.offset(), dirs.clone()));
+            }
+        };
+        if let Some(lines) = &*self.imp().drawing.borrow()
+            && let Some((_, dirs)) = lines.iter().find(|(at, _)| *at == start.offset())
+        {
+            return dirs.clone();
+        }
+        let shown = start.visible_text(end);
+        let text = start.text(end);
+        let cache = &self.imp().directions;
+        if let Some((at, t, v, dirs)) = &*cache.borrow()
+            && *at == start.offset()
+            && t.as_str() == text.as_str()
+            && v.as_str() == shown.as_str()
+        {
+            drawn(dirs);
+            return dirs.clone();
+        }
+        let any_rtl = shown.chars().any(is_rtl);
+        // the hidden runs (only `conceal` hides), from its toggles
+        let mut hidden = Vec::new();
+        if let Some(conceal) = self.buffer().tag_table().lookup("conceal") {
+            let mut iter = *start;
+            if !iter.has_tag(&conceal) {
+                iter.forward_to_tag_toggle(Some(&conceal));
+            }
+            while iter < *end && iter.has_tag(&conceal) {
+                let from = iter.offset();
+                iter.forward_to_tag_toggle(Some(&conceal));
+                hidden.push((from, iter.offset()));
+                if !iter.forward_to_tag_toggle(Some(&conceal)) {
+                    break;
+                }
+            }
+        }
+        let mut runs = hidden.iter().peekable();
+        // per character: its offset, its own direction (`None` for spaces
+        // and marks), and how it counts for those next to it (numbers lie
+        // left to right, but count as right to left there, unless European
+        // digits follow left-to-right text)
+        // the line's direction: its first letter's (numbers aside)
+        let base = any_rtl
+            && shown
+                .chars()
+                .find_map(|c| {
+                    if is_rtl(c) {
+                        Some(true)
+                    } else if c.is_alphabetic() {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(false);
+        let mut chars: Vec<(i32, Option<bool>, Option<bool>)> = Vec::new();
+        let mut last_strong = base;
+        for (i, c) in text.chars().enumerate() {
+            let offset = start.offset() + i as i32;
+            while runs.next_if(|(_, to)| *to <= offset).is_some() {}
+            if runs.peek().is_some_and(|(from, _)| *from <= offset) {
+                continue;
+            }
+            let arabic_digit = matches!(c as u32, 0x0660..=0x0669 | 0x06F0..=0x06F9);
+            let (own, around) = if !any_rtl {
+                (Some(false), Some(false))
+            } else if is_rtl(c) {
+                last_strong = true;
+                (Some(true), Some(true))
+            } else if arabic_digit {
+                (Some(false), Some(true))
+            } else if c.is_numeric() {
+                (Some(false), Some(last_strong))
+            } else if c.is_alphanumeric() {
+                last_strong = false;
+                (Some(false), Some(false))
+            } else {
+                (None, None)
+            };
+            chars.push((offset, own, around));
+        }
+        // what comes after each character, from the end
+        let mut after = vec![base; chars.len()];
+        let mut next = base;
+        for (i, (_, _, around)) in chars.iter().enumerate().rev() {
+            after[i] = next;
+            if let Some(d) = around {
+                next = *d;
+            }
+        }
+        let mut before = base;
+        let mut out = Vec::with_capacity(chars.len());
+        for (i, (offset, own, around)) in chars.iter().enumerate() {
+            let rtl = match own {
+                Some(d) => *d,
+                None if before == after[i] => before,
+                None => base,
+            };
+            if let Some(d) = around {
+                before = *d;
+            }
+            out.push((*offset, rtl));
+        }
+        let dirs: Directions = Rc::new(LineChars {
+            any_rtl,
+            base,
+            chars: out,
+        });
+        cache.replace(Some((
+            start.offset(),
+            text.into(),
+            shown.into(),
+            dirs.clone(),
+        )));
+        drawn(&dirs);
+        dirs
+    }
+
+    /// The cursor box at `from`, as tall as the text of `[from, to)`: the
+    /// height comes from its first character that is shown at full size,
+    /// not a code span's tiny hidden backtick (`pad`) or hidden syntax.
+    fn glyphs_from(&self, from: &gtk::TextIter, to: &gtk::TextIter) -> gdk::Rectangle {
+        let at = self.cursor_at(from);
+        let pad = self.buffer().tag_table().lookup("pad");
+        let mut iter = *from;
+        while iter < *to && !iter.ends_line() {
+            let small = pad.as_ref().is_some_and(|p| iter.has_tag(p));
+            let hidden = iter.tags().iter().any(|t| t.is_invisible());
+            if !small && !hidden {
+                let glyphs = self.cursor_at(&iter);
+                if glyphs.y() != at.y() && iter > *from && self.starts_display_line(&iter) {
+                    break; // on the next row already
+                }
+                return gdk::Rectangle::new(at.x(), glyphs.y(), at.width(), glyphs.height());
+            }
+            iter.forward_char();
+        }
+        at
     }
 
     /// Where the cursor would be at `iter`. Unlike `iter_location`, right
@@ -297,7 +581,7 @@ impl View {
                     x2 += newline;
                 }
                 if x2 > x1 {
-                    let glyphs = self.cursor_at(&a);
+                    let glyphs = self.glyphs_from(&a, &b);
                     let (mut y, mut height) = if single {
                         self.glyph_box(&glyphs)
                     } else {
@@ -307,7 +591,7 @@ impl View {
                     // between paragraphs (headings, list starts) so the
                     // block has no stripes
                     if !single {
-                        let (py, ph) = self.line_yrange(&line);
+                        let (py, ph) = self.true_yrange(&line);
                         let (py, pbottom) = (py as f32, (py + ph) as f32);
                         if line.starts_line() && start < line && py < y {
                             height += y - py;
@@ -331,12 +615,121 @@ impl View {
         }
     }
 
+    /// The room moved from below the line starting at `start` to the top
+    /// of the next one (see `Editor::fix_margins`): what it would have
+    /// below without `no-below`.
+    fn carried(&self, start: &gtk::TextIter) -> i32 {
+        let table = self.buffer().tag_table();
+        match table.lookup("no-below") {
+            Some(no_below) if start.has_tag(&no_below) => room_below(start),
+            _ => 0,
+        }
+    }
+
+    /// The room moved to the top of line `n`: what the shown line before
+    /// it carries (lines hidden whole, like a setext `===`, take no room
+    /// and pass it on). For `n` past the last line, what goes below it all.
+    fn carried_into(&self, n: usize) -> i32 {
+        let buffer = self.buffer();
+        for m in (0..n).rev() {
+            let Some(start) = buffer.iter_at_line(m as i32) else {
+                continue;
+            };
+            if !self.hidden_whole(&start) {
+                return self.carried(&start);
+            }
+        }
+        0
+    }
+
+    /// Whether the line starting at `start` is hidden with its line break,
+    /// so GTK gives it no height (nor any of its room).
+    fn hidden_whole(&self, start: &gtk::TextIter) -> bool {
+        let Some(conceal) = self.buffer().tag_table().lookup("conceal") else {
+            return false;
+        };
+        if !start.has_tag(&conceal) {
+            return false;
+        }
+        let mut next = *start;
+        if !next.forward_line() {
+            return false;
+        }
+        let mut off = *start;
+        off.forward_to_tag_toggle(Some(&conceal));
+        off >= next
+    }
+
+    /// `line_yrange` of the line at `iter` as it would be without the
+    /// room moved between lines: its own room above and below, so boxes
+    /// and pictures sit where they always have.
+    fn true_yrange(&self, iter: &gtk::TextIter) -> (i32, i32) {
+        let mut start = *iter;
+        start.set_line_offset(0);
+        let (y, h) = self.line_yrange(&start);
+        let from_above = self.carried_into(start.line() as usize);
+        (y + from_above, h - from_above + self.carried(&start))
+    }
+
+    /// The first line to draw for what is on screen: the one at the top
+    /// and the shown one before it, whose room may have moved down onto
+    /// the screen (see `Editor::fix_margins`).
+    fn first_drawn_line(&self) -> gtk::TextIter {
+        let (mut iter, _) = self.line_at_y(self.visible_rect().y());
+        iter.set_line_offset(0);
+        let buffer = self.buffer();
+        let mut n = iter.line();
+        while n > 0 {
+            n -= 1;
+            let Some(prev) = buffer.iter_at_line(n) else {
+                break;
+            };
+            iter = prev;
+            if !self.hidden_whole(&iter) {
+                break;
+            }
+        }
+        iter
+    }
+
     /// Lines `[first, last]` that are on screen (or partly).
     fn visible_lines(&self) -> (usize, usize) {
         let visible = self.visible_rect();
-        let (top, _) = self.line_at_y(visible.y());
+        let top = self.first_drawn_line();
         let (bottom, _) = self.line_at_y(visible.y() + visible.height());
         (top.line() as usize, bottom.line() as usize)
+    }
+
+    /// Of `ranges` (in order, as `[start, end)` offsets), those whose text
+    /// is on screen: the lines on screen can be one long paragraph, with
+    /// hundreds of them off it. Found by halving, as each look at a place
+    /// costs on a long line with much hidden text.
+    fn on_screen(&self, ranges: &[(i32, i32)]) -> std::ops::Range<usize> {
+        if ranges.len() <= 16 {
+            return 0..ranges.len();
+        }
+        let buffer = self.buffer();
+        let visible = self.visible_rect();
+        // boxes and rings reach a little past their text
+        let slack = 40;
+        let (top, bottom) = (visible.y() - slack, visible.y() + visible.height() + slack);
+        let rect = |offset: i32| self.cursor_at(&buffer.iter_at_offset(offset));
+        let first = ranges.partition_point(|&(_, end)| {
+            let at = rect(end);
+            at.y() + at.height() < top
+        });
+        let last = first + ranges[first..].partition_point(|&(start, _)| rect(start).y() <= bottom);
+        first..last
+    }
+
+    /// The ranges of `tag` whose text is on screen, for drawing on it.
+    fn tag_ranges_shown(&self, name: &str) -> Vec<(gtk::TextIter, gtk::TextIter)> {
+        let ranges = self.tag_ranges(name);
+        let offsets: Vec<(i32, i32)> = ranges
+            .iter()
+            .map(|(a, b)| (a.offset(), b.offset()))
+            .collect();
+        ranges[self.on_screen(&offsets)].to_vec()
     }
 
     /// The ranges of `tag` on screen.
@@ -346,7 +739,7 @@ impl View {
             return out;
         };
         let visible = self.visible_rect();
-        let (mut iter, _) = self.line_at_y(visible.y());
+        let mut iter = self.first_drawn_line();
         let (mut end, _) = self.line_at_y(visible.y() + visible.height());
         end.forward_line();
         if !iter.has_tag(&tag) && !iter.forward_to_tag_toggle(Some(&tag)) {
@@ -364,33 +757,143 @@ impl View {
     }
 
     /// Where `[a, b)` is on screen, one (x1, x2, glyphs) per display line it
-    /// is on. Something wrapped over three lines or more skips the middle.
-    /// Measured with cursor positions: GTK places characters next to hidden
-    /// text wrongly in `iter_location`, but its cursors right.
+    /// is on, every row of a wrapped one included. Measured with cursor
+    /// positions: GTK places characters next to hidden text wrongly in
+    /// `iter_location`, but its cursors right.
     fn range_rects(&self, a: &gtk::TextIter, b: &gtk::TextIter) -> Vec<(f32, f32, gdk::Rectangle)> {
         let mut out = Vec::new();
         if a >= b {
             return out;
         }
         let cursor = |iter: &gtk::TextIter| self.cursor_locations(Some(iter)).0;
-        let first = cursor(a);
-        let mut probe = *a;
-        let one_line = !self.forward_display_line(&mut probe) || probe >= *b;
-        if one_line {
-            out.push((first.x() as f32, cursor(b).x() as f32, first));
-        } else {
-            let mut line_end = *a;
-            self.forward_display_line_end(&mut line_end);
-            out.push((first.x() as f32, cursor(&line_end).x() as f32, first));
-            let mut line_start = *b;
-            line_start.backward_char();
-            if !self.starts_display_line(&line_start) {
-                self.backward_display_line_start(&mut line_start);
+        // in a line with right-to-left text, `[from, to)` of a row is not
+        // from one cursor to the other: from its leftmost character's left
+        // edge to its rightmost's right (all between, at a change of
+        // direction)
+        let bidi = |row: &gtk::TextIter, from: &gtk::TextIter, to: &gtk::TextIter| {
+            let mut start = *row;
+            if !self.starts_display_line(&start) {
+                self.backward_display_line_start(&mut start);
             }
-            let start = cursor(&line_start);
-            out.push((start.x() as f32, cursor(b).x() as f32, start));
+            let mut line = start;
+            line.set_line_offset(0);
+            let mut line_end = line;
+            if !line_end.ends_line() {
+                line_end.forward_to_line_end();
+            }
+            self.line_directions(&line, &line_end)?;
+            self.row_spans(&start, Some((from.offset(), to.offset())))
+                .into_iter()
+                .fold(None, |acc: Option<(i32, i32)>, (_, l, r)| {
+                    Some(acc.map_or((l, r), |(a, b)| (a.min(l), b.max(r))))
+                })
+                .map(|(l, r)| (l as f32, r as f32))
+        };
+        let mut row = *a;
+        loop {
+            let first = self.glyphs_from(&row, b);
+            let mut next = row;
+            if !self.forward_display_line(&mut next) || next <= row || next > *b {
+                let (x1, x2) =
+                    bidi(&row, &row, b).unwrap_or((first.x() as f32, cursor(b).x() as f32));
+                out.push((x1, x2, first));
+                return out;
+            }
+            // this row ends where it wraps, before the next one starts
+            let (x1, x2) = bidi(&row, &row, &next)
+                .unwrap_or((first.x() as f32, self.row_right(&row, &next) as f32));
+            out.push((x1, x2, first));
+            if next == *b {
+                // ends right where the row wraps: nothing on the next one
+                return out;
+            }
+            row = next;
         }
-        out
+    }
+
+    /// The character under a point (buffer coordinates) on a line that has
+    /// one of `tags`; `None` elsewhere. Measured with cursor positions:
+    /// `iter_at_location` misplaces characters next to hidden text (see
+    /// `range_rects`) and finds none at all in parts of a table row.
+    fn char_at(&self, x: i32, y: i32, tags: &[&gtk::TextTag]) -> Option<gtk::TextIter> {
+        let (line, _) = self.line_at_y(y);
+        let tagged = tags.is_empty()
+            || tags.iter().any(|tag| {
+                let mut probe = line;
+                probe.has_tag(*tag)
+                    || (probe.forward_to_tag_toggle(Some(*tag)) && probe.line() == line.line())
+            });
+        if !tagged {
+            return None;
+        }
+        let mut line_end = line;
+        if !line_end.ends_line() {
+            line_end.forward_to_line_end();
+        }
+        let scan_row = |row: gtk::TextIter| {
+            let start = self.cursor_locations(Some(&row)).0;
+            let (top, height) = self.line_box(&start);
+            if !(top..top + height).contains(&(y as f32)) {
+                return None;
+            }
+            self.row_char_at(&row, x)
+        };
+        // the row at the point: each row of the line in turn (not with
+        // `iter_at_location`, which aborts on a line whose hidden text
+        // changed and is not laid out again yet)
+        let mut row = line;
+        loop {
+            let top = self.line_box(&self.cursor_locations(Some(&row)).0).0;
+            if top > y as f32 {
+                return None; // past the point
+            }
+            if let Some(found) = scan_row(row) {
+                return Some(found);
+            }
+            let mut next = row;
+            if !self.forward_display_line(&mut next) || next <= row || next > line_end {
+                return None;
+            }
+            row = next;
+        }
+    }
+
+    /// The end of the line, for a point right of it on its last row when
+    /// hidden text is on that row (GTK places the cursor wrongly there).
+    fn past_line_end(&self, x: i32, y: i32) -> Option<gtk::TextIter> {
+        let (line, _) = self.line_at_y(y);
+        let mut end = line;
+        if !end.ends_line() {
+            end.forward_to_line_end();
+        }
+        let mut row = end;
+        if !self.starts_display_line(&row) {
+            self.backward_display_line_start(&mut row);
+        }
+        let (top, height) = self.line_box(&self.cursor_at(&row));
+        if !(top..top + height).contains(&(y as f32)) {
+            return None;
+        }
+        let hidden = |i: &gtk::TextIter| i.tags().iter().any(|t| t.is_invisible());
+        let mut any_hidden = false;
+        let mut last = None;
+        let mut iter = row;
+        while iter < end {
+            if hidden(&iter) {
+                any_hidden = true;
+            } else {
+                last = Some(iter);
+            }
+            iter.forward_char();
+        }
+        let last = last?;
+        let mut after = last;
+        after.forward_char();
+        // right of the last character shown (in left-to-right text: in
+        // right-to-left text GTK's own placing is right)
+        let after_x = self.cursor_at(&after).x();
+        let ltr = self.cursor_at(&last).x() <= after_x;
+        (any_hidden && ltr && x >= after_x).then_some(end)
     }
 
     /// GitHub-style boxes behind code blocks and tables.
@@ -416,16 +919,19 @@ impl View {
             }
             let first = n;
             let mut last = n;
+            // a table is measured whole (its box is as wide as its widest
+            // row, on screen or not); a long code block only on screen
+            let whole = blocks[first].is_table();
             while last + 1 < blocks.len()
                 && continues(blocks[last], blocks[last + 1])
-                && last <= bottom
+                && (last <= bottom || whole)
             {
                 last += 1;
             }
             n = last + 1;
             let yrange = |line: usize| {
                 let iter = self.buffer().iter_at_line(line as i32);
-                iter.map(|i| self.line_yrange(&i)).unwrap_or_default()
+                iter.map(|i| self.true_yrange(&i)).unwrap_or_default()
             };
             let (y, _) = yrange(first);
             let (ly, lh) = yrange(last);
@@ -482,6 +988,8 @@ impl View {
         let mut left = f32::MAX;
         let mut right = 0.0f32;
         let mut columns = Vec::new();
+        // a row wider than the window wraps: the box takes all the width
+        let mut wraps = false;
         for n in first..=last {
             let Some(start) = buffer.iter_at_line(n as i32) else {
                 continue;
@@ -493,6 +1001,8 @@ impl View {
             if start >= end {
                 continue;
             }
+            wraps |= self.cursor_locations(Some(&start)).0.y()
+                != self.cursor_locations(Some(&end)).0.y();
             let mut last_char = end;
             last_char.backward_char();
             left = left.min(if start.char() == '|' {
@@ -515,6 +1025,11 @@ impl View {
                 }
             }
         }
+        if wraps {
+            // its column lines would cross the wrapped text
+            right = self.width() as f32 - 1.0;
+            columns.clear();
+        }
         if left >= right {
             return;
         }
@@ -528,7 +1043,7 @@ impl View {
             let Some(iter) = buffer.iter_at_line(n as i32) else {
                 continue;
             };
-            let (y, h) = self.line_yrange(&iter);
+            let (y, h) = self.true_yrange(&iter);
             let (y, h) = (y as f32, h as f32);
             match blocks.get(n) {
                 Some(Block::TableHead) => {
@@ -572,7 +1087,7 @@ impl View {
         let zoom = self.zoom();
         let ink = self.color();
         for (name, key) in [("code-box", false), ("kbd-box", true)] {
-            for (a, b) in self.tag_ranges(name) {
+            for (a, b) in self.tag_ranges_shown(name) {
                 // measured on the text itself: each character's box is as
                 // tall as its own font, and the syntax around it is hidden
                 // or tiny; the padding is where the syntax sits
@@ -605,7 +1120,7 @@ impl View {
             return;
         };
         let zoom = self.zoom();
-        for (a, b) in self.tag_ranges("link") {
+        for (a, b) in self.tag_ranges_shown("link") {
             for (x1, x2, glyphs) in self.range_rects(&a, &b) {
                 let (y, height) = self.glyph_box(&glyphs);
                 let thick = (2.0 * zoom).round().max(1.0);
@@ -628,9 +1143,9 @@ impl View {
         let zoom = self.zoom();
         let color = self.color();
         let visible = self.visible_rect();
-        let (mut iter, _) = self.line_at_y(visible.y());
+        let mut iter = self.first_drawn_line();
         loop {
-            let (y, _) = self.line_yrange(&iter);
+            let (y, _) = self.true_yrange(&iter);
             if y > visible.y() + visible.height() {
                 break;
             }
@@ -728,9 +1243,9 @@ impl View {
         let visible = self.visible_rect();
         let buffer = self.buffer();
         let cursor = buffer.iter_at_mark(&buffer.get_insert()).line() as usize;
-        let (mut iter, _) = self.line_at_y(visible.y());
+        let mut iter = self.first_drawn_line();
         loop {
-            let (y, h) = self.line_yrange(&iter);
+            let (y, h) = self.true_yrange(&iter);
             if y > visible.y() + visible.height() {
                 break;
             }
@@ -801,14 +1316,68 @@ impl View {
             return;
         };
         let zoom = self.zoom();
-        for (a, b) in self.tag_ranges("mark") {
+        for (a, b) in self.tag_ranges_shown("mark") {
             for (x1, x2, glyphs) in self.range_rects(&a, &b) {
                 let (y, height) = self.glyph_box(&glyphs);
                 let pad = 2.0 * zoom;
-                let rect = graphene::Rect::new(x1 - pad, y, x2 - x1 + 2.0 * pad, height);
+                let left = (x1 - pad).max(0.0);
+                let rect = graphene::Rect::new(left, y, x2 + pad - left, height);
                 snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(rect, 4.0 * zoom));
                 snapshot.append_color(&tint(&accent, 0.6), &rect);
                 snapshot.pop();
+            }
+        }
+    }
+
+    /// Find in the note: every match on screen ringed in the text colour,
+    /// the one gone to filled with the accent as well.
+    fn draw_finds(&self, snapshot: &gtk::Snapshot) {
+        let finds = self.imp().finds.borrow();
+        if finds.is_empty() {
+            return;
+        }
+        let (Some(accent), Some(ink)) = (*self.imp().accent.borrow(), *self.imp().ink.borrow())
+        else {
+            return;
+        };
+        let current = self.imp().find_current.get();
+        let buffer = self.buffer();
+        let visible = self.visible_rect();
+        let (top, _) = self.line_at_y(visible.y());
+        let (mut bottom, _) = self.line_at_y(visible.y() + visible.height());
+        bottom.forward_to_line_end();
+        let (top, bottom) = (top.offset(), bottom.offset());
+        let first = finds.partition_point(|&(_, end)| end < top);
+        let last = first + finds[first..].partition_point(|&(start, _)| start <= bottom);
+        let shown = self.on_screen(&finds[first..last]);
+        let zoom = self.zoom();
+        let radius = 4.0 * zoom;
+        let pad = 2.0 * zoom;
+        for (i, &(a, b)) in finds
+            .iter()
+            .enumerate()
+            .take(first + shown.end)
+            .skip(first + shown.start)
+        {
+            let (a, b) = (buffer.iter_at_offset(a), buffer.iter_at_offset(b));
+            let on = current == Some(i);
+            for (x1, x2, glyphs) in self.range_rects(&a, &b) {
+                if x2 <= x1 {
+                    continue; // hidden syntax
+                }
+                let (y, height) = self.glyph_box(&glyphs);
+                // the view ends at the text's left edge: stay inside it
+                let left = (x1 - pad).max(1.0);
+                let rect = graphene::Rect::new(left, y, x2 + pad - left, height);
+                let rounded = gsk::RoundedRect::from_rect(rect, radius);
+                if on {
+                    snapshot.push_rounded_clip(&rounded);
+                    snapshot.append_color(&accent, &rect);
+                    snapshot.pop();
+                }
+                let width = if on { 2.0 } else { 1.5 } * zoom;
+                let ring = tint(&ink, if on { 0.85 } else { 0.4 });
+                snapshot.append_border(&rounded, &[width; 4], &[ring; 4]);
             }
         }
     }
@@ -836,7 +1405,7 @@ impl View {
             let Some(start) = self.buffer().iter_at_line(n as i32) else {
                 continue;
             };
-            let (y, h) = self.line_yrange(&start);
+            let (y, h) = self.true_yrange(&start);
             let total: f32 = shown.iter().map(|(_, _, h)| h + gap).sum::<f32>() + gap;
             let x = self.cursor_locations(Some(&start)).0.x() as f32;
             let mut top = (y + h) as f32 - total + gap;
@@ -883,6 +1452,147 @@ impl View {
 use markdown::continues;
 
 /// Whether `tag` is on any of `[start, end)`.
+/// The room a line has below it (`start` is its start) from its tags, as
+/// GTK takes it: from the strongest tag that sets it, `no-below` aside.
+fn room_below(start: &gtk::TextIter) -> i32 {
+    strongest(start, |t| {
+        (t.is_pixels_below_lines_set() && t.name().as_deref() != Some("no-below"))
+            .then(|| t.pixels_below_lines())
+    })
+}
+
+/// The room a line has above it from its own tags (not a `lift`).
+fn room_above(start: &gtk::TextIter) -> i32 {
+    strongest(start, |t| {
+        let lift = t.name().is_some_and(|n| n.starts_with("lift-"));
+        (t.is_pixels_above_lines_set() && !lift).then(|| t.pixels_above_lines())
+    })
+}
+
+/// The value of the strongest (highest priority) tag at `iter` that has
+/// one; 0 if none does.
+fn strongest(iter: &gtk::TextIter, value: impl Fn(&gtk::TextTag) -> Option<i32>) -> i32 {
+    iter.tags()
+        .iter()
+        .filter_map(|t| value(t).map(|v| (t.priority(), v)))
+        .max_by_key(|(priority, _)| *priority)
+        .map_or(0, |(_, v)| v)
+}
+
+/// The shown characters of a line and their directions (see
+/// `View::line_chars`).
+struct LineChars {
+    /// Whether any reads right to left.
+    any_rtl: bool,
+    /// Whether the line does.
+    base: bool,
+    /// Offsets, in order, and whether each reads right to left.
+    chars: Vec<(i32, bool)>,
+}
+
+type Directions = Rc<LineChars>;
+
+/// `line_chars` of the lines drawn so far in a frame, by their start.
+type DrawnLines = Vec<(i32, Directions)>;
+
+/// A display row, to measure its characters with cursor positions: GTK
+/// gets those right, unlike `iter_location`, whose places and widths go
+/// wrong next to hidden text. Pango puts the trailing edge of the
+/// character before a place and the leading edge of the one after it at
+/// its two cursors, the strong one being where text of the line's
+/// direction goes: which is which tells right-to-left text apart. Each
+/// cursor is looked up once, and only when needed: on a long line with
+/// much hidden text each look costs.
+struct Row<'a> {
+    view: &'a View,
+    /// The row's shown characters: offsets, and whether each reads right
+    /// to left.
+    shown: Vec<(i32, bool)>,
+    base: bool,
+    /// Where the next row starts, if the line goes on there.
+    wraps_at: Option<i32>,
+    cursors: RefCell<HashMap<i32, (i32, i32)>>,
+}
+
+impl<'a> Row<'a> {
+    fn new(view: &'a View, row: &gtk::TextIter) -> Row<'a> {
+        let mut line = *row;
+        line.set_line_offset(0);
+        let mut line_end = line;
+        if !line_end.ends_line() {
+            line_end.forward_to_line_end();
+        }
+        let chars = view.line_chars(&line, &line_end);
+        // where GTK starts the next row: asked once, not at each character
+        let mut next = *row;
+        let wraps_at = (view.forward_display_line(&mut next) && next > *row && next < line_end)
+            .then(|| next.offset());
+        let end = wraps_at.unwrap_or(line_end.offset());
+        let from = chars.chars.partition_point(|(o, _)| *o < row.offset());
+        let to = chars.chars.partition_point(|(o, _)| *o < end);
+        Row {
+            view,
+            shown: chars.chars[from..to].to_vec(),
+            base: chars.base,
+            wraps_at,
+            cursors: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// The strong and weak cursor x at `offset`.
+    fn cursors_at(&self, offset: i32) -> (i32, i32) {
+        *self.cursors.borrow_mut().entry(offset).or_insert_with(|| {
+            let place = self.view.buffer().iter_at_offset(offset);
+            let (strong, weak) = self.view.cursor_locations(Some(&place));
+            (strong.x(), weak.x())
+        })
+    }
+
+    /// The left and right edge of the `i`th shown character.
+    fn span(&self, i: usize) -> (i32, i32) {
+        let (offset, rtl) = self.shown[i];
+        let base = self.base;
+        // a row starts in the line's direction
+        let before = match i {
+            0 => base,
+            _ => self.shown[i - 1].1,
+        };
+        let (strong, weak) = self.cursors_at(offset);
+        let leading = if before == base { weak } else { strong };
+        // the trailing edge, at the place after it
+        let trailing = |place: i32| {
+            let (strong, weak) = self.cursors_at(place);
+            if rtl == base { strong } else { weak }
+        };
+        let trail = match self.shown.get(i + 1) {
+            Some((next, _)) => trailing(*next),
+            // the row's last: up to the place right after it, unless that
+            // is where the next row starts
+            None if self.wraps_at == Some(offset + 1) => {
+                let place = self.view.buffer().iter_at_offset(offset);
+                let width = self.view.iter_location(&place).width();
+                if rtl {
+                    leading - width
+                } else {
+                    leading + width
+                }
+            }
+            None => trailing(offset + 1),
+        };
+        (leading.min(trail), leading.max(trail))
+    }
+}
+
+/// A letter of a script written right to left (Hebrew, Arabic and the
+/// like).
+/// Not their digits: Pango lays those out left to right.
+fn is_rtl(c: char) -> bool {
+    let digit = matches!(c as u32, 0x0660..=0x0669 | 0x06F0..=0x06F9);
+    !digit
+        && matches!(c as u32,
+            0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF)
+}
+
 fn has_tag_in(start: &gtk::TextIter, end: &gtk::TextIter, tag: &gtk::TextTag) -> bool {
     let mut iter = *start;
     start.has_tag(tag) || (iter.forward_to_tag_toggle(Some(tag)) && iter < *end)
@@ -984,11 +1694,16 @@ struct Tags {
     /// On every line `decorate_line` put something on: lines without it
     /// have nothing to take off.
     decorated: gtk::TextTag,
+    /// No room below a line that has hidden text: its room moves to the
+    /// top of the next line (`lift`). See `Editor::fix_margins`.
+    no_below: gtk::TextTag,
     /// Made when first needed: numbered items' margins by (level, digits),
-    /// and the room under a line for its pictures by height.
+    /// the room under a line for its pictures by height, and the room a
+    /// line has above it with the room moved down from the line before.
     table: gtk::TextTagTable,
     numbers: RefCell<HashMap<(usize, u8), gtk::TextTag>>,
     picture_room: RefCell<HashMap<i32, gtk::TextTag>>,
+    lifts: RefCell<HashMap<i32, gtk::TextTag>>,
     zoom: Cell<f64>,
 }
 
@@ -1010,6 +1725,9 @@ impl Tags {
             body: add(gtk::TextTag::builder()
                 .name("body")
                 .line_height(LINE_HEIGHT as f32)
+                // so the view's own room above reaches only an empty last
+                // line, which has no text to take tags (`fix_margins`)
+                .pixels_above_lines(0)
                 .build()),
             headings: [
                 heading(1, 20.0, 500),
@@ -1181,9 +1899,14 @@ impl Tags {
                 .foreground_rgba(&gdk::RGBA::new(0.0, 0.0, 0.0, 0.001))
                 .build()),
             decorated: plain("decorated"),
+            no_below: add(gtk::TextTag::builder()
+                .name("no-below")
+                .pixels_below_lines(0)
+                .build()),
             table: table.clone(),
             numbers: RefCell::new(HashMap::new()),
             picture_room: RefCell::new(HashMap::new()),
+            lifts: RefCell::new(HashMap::new()),
             zoom: Cell::new(1.0),
         };
         tags.set_zoom(1.0);
@@ -1218,6 +1941,9 @@ impl Tags {
         self.code_line.set_left_margin(px(14.0));
         self.code_line.set_right_margin(px(14.0));
         self.table_line.set_right_margin(px(4.0));
+        // a row too wide for the window goes on, indented, inside its box
+        // (a negative indent: GTK indents the lines after the first)
+        self.table_line.set_indent(-px(TABLE_WRAP_INDENT));
         self.fence_open
             .set_pixels_above_lines(px(BLOCK_GAP + CODE_PAD));
         self.fence_close
@@ -1290,6 +2016,25 @@ impl Tags {
                 let tag = gtk::TextTag::builder()
                     .name(format!("picture-room-{height}"))
                     .pixels_below_lines(height)
+                    .build();
+                self.table.add(&tag);
+                // `no_below` must still win over it
+                self.no_below.set_priority(self.table.size() - 1);
+                tag
+            })
+            .clone()
+    }
+
+    /// Room above a line, `pixels` (its own and what moved down to it).
+    /// Made after the paragraph tags, so it wins over theirs.
+    fn lift(&self, pixels: i32) -> gtk::TextTag {
+        self.lifts
+            .borrow_mut()
+            .entry(pixels)
+            .or_insert_with(|| {
+                let tag = gtk::TextTag::builder()
+                    .name(format!("lift-{pixels}"))
+                    .pixels_above_lines(pixels)
                     .build();
                 self.table.add(&tag);
                 tag
@@ -1466,10 +2211,18 @@ struct Callbacks {
     status: Option<Box<dyn Fn(String)>>,
     error: Option<Box<dyn Fn(String)>>,
     open_file: Option<Box<dyn Fn(PathBuf)>>,
+    word_count: Option<Box<dyn Fn(bool)>>,
 }
 
 struct Inner {
     root: gtk::Overlay,
+    find: Rc<find::FindBar>,
+    word_count: Rc<stats::WordCount>,
+    /// A recount is waiting for the typing to pause.
+    recount_timer: RefCell<Option<glib::SourceId>>,
+    /// Where finding starts from: the cursor when the bar opened, then
+    /// the match last gone to. A mark, so edits before it move it along.
+    find_from: gtk::TextMark,
     toolbar_buttons: RefCell<Vec<(&'static str, gtk::Button)>>,
     view: View,
     buffer: gtk::TextBuffer,
@@ -1528,6 +2281,8 @@ impl Editor {
 
         let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         column.add_css_class("editor-view");
+        // room for the back button and the find bar side by side
+        column.set_size_request(340, -1);
         column.append(&back);
         column.append(&scroller);
 
@@ -1541,6 +2296,20 @@ impl Editor {
         let root = gtk::Overlay::new();
         root.set_child(Some(&column));
         root.add_overlay(&notch);
+        // find in the note: top right, level with the back button
+        let find = find::FindBar::new();
+        find.widget.set_margin_top(14);
+        find.widget.set_margin_end(20);
+        // never over the back button, however narrow the window
+        find.widget.set_margin_start(96);
+        root.add_overlay(&find.widget);
+        // the word count: bottom left, just above the status bar, under
+        // the text rather than over it
+        let word_count = stats::WordCount::new();
+        word_count.counter.set_margin_top(4);
+        word_count.counter.set_margin_bottom(8);
+        column.append(&word_count.counter);
+        word_count.menu.set_parent(&root);
 
         let toolbar = gtk::Popover::builder()
             .has_arrow(false)
@@ -1553,6 +2322,10 @@ impl Editor {
 
         let editor = Editor(Rc::new(Inner {
             root,
+            find,
+            find_from: gtk::TextMark::new(Some("find-from"), true),
+            word_count,
+            recount_timer: RefCell::new(None),
             toolbar_buttons: RefCell::new(Vec::new()),
             view,
             buffer,
@@ -1570,6 +2343,8 @@ impl Editor {
         editor.connect_pointer();
         editor.connect_clipboard();
         editor.connect_links();
+        editor.connect_find();
+        editor.connect_word_count();
         let weak = editor.downgrade();
         editor
             .0
@@ -1641,12 +2416,21 @@ impl Editor {
         let ink = gdk::RGBA::parse(theme.ink).unwrap_or(gdk::RGBA::BLACK);
         self.0.tags.set_ink(&ink);
         self.0.view.imp().accent.replace(Some(theme.accent_rgba()));
+        self.0.view.imp().ink.replace(Some(ink));
         self.0.view.queue_draw();
     }
 
     pub fn set_zoom(&self, zoom: f64) {
         self.0.view.imp().zoom.set(zoom);
         self.0.tags.set_zoom(zoom);
+        // the rooms moved between lines are in pixels: as big as now
+        for n in 0..self.line_count() {
+            self.fix_room_below(n);
+        }
+        for n in 0..self.line_count() {
+            self.fix_room_above(n);
+        }
+        self.fix_margins(self.line_count().saturating_sub(1));
         self.relayout();
     }
 
@@ -1861,6 +2645,7 @@ impl Editor {
         }
         buffer.apply_tag(&tags.body, &start, &end);
         self.apply_kind_tags(line, &start, &end);
+        self.fix_margins(line);
     }
 
     /// Heading / list / quote paragraph tags for one line (nothing removed
@@ -2147,8 +2932,89 @@ impl Editor {
             buffer.block_signal(id);
         }
         self.put_decorations(n, line, fresh);
+        self.fix_margins(n);
         for id in self.0.tag_handlers.borrow().iter() {
             buffer.unblock_signal(id);
+        }
+    }
+
+    /// GTK 4 aborts the whole app ("Byte index … is off the end of the
+    /// line") when it looks up the point in the room below a line that
+    /// has hidden text: a click there, a drag over it, Page Down landing
+    /// on it. It takes the line's length with the hidden text as one
+    /// without (`gtk_text_layout_get_iter_at_position`). So no line with
+    /// hidden text gets room below it: that room becomes room above the
+    /// next line (the last line's goes below the text), and the drawing
+    /// puts it back where it belongs (`View::true_yrange`).
+    fn fix_margins(&self, n: usize) {
+        let count = self.line_count();
+        if count == 0 {
+            return;
+        }
+        let last = count - 1;
+        let first = n.saturating_sub(1).min(last);
+        for m in first..=(n + 1).min(last) {
+            self.fix_room_below(m);
+        }
+        for m in first..=(n + 3).min(last) {
+            self.fix_room_above(m);
+        }
+        let view = &self.0.view;
+        // an empty last line has no text to tag: its lift is the view's
+        // room above lines, which every other line has `body` to override
+        let last_start = self.line_start(last);
+        let empty_last = last > 0 && last_start.is_end();
+        let above_last = if empty_last {
+            view.carried_into(last)
+        } else {
+            0
+        };
+        if view.pixels_above_lines() != above_last {
+            view.set_pixels_above_lines(above_last);
+        }
+        let below_all = view.carried_into(count);
+        if view.bottom_margin() != below_all {
+            view.set_bottom_margin(below_all);
+        }
+    }
+
+    /// Takes the room below line `m` away if it has hidden text (or gives
+    /// it back if it no longer has).
+    fn fix_room_below(&self, m: usize) {
+        let (start, end) = self.line_span(m);
+        let tags = &self.0.tags;
+        let has = start.has_tag(&tags.no_below);
+        let want = room_below(&start) > 0 && has_tag_in(&start, &end, &tags.conceal);
+        if want != has {
+            let buffer = &self.0.buffer;
+            if want {
+                buffer.apply_tag(&tags.no_below, &start, &end);
+            } else {
+                buffer.remove_tag(&tags.no_below, &start, &end);
+            }
+        }
+    }
+
+    /// Puts the room taken from below line `m - 1` above line `m`, on top
+    /// of the room it has above it already.
+    fn fix_room_above(&self, m: usize) {
+        let (start, end) = self.line_span(m);
+        let moved = match self.0.view.hidden_whole(&start) {
+            true => 0,
+            false => self.0.view.carried_into(m),
+        };
+        let want = (moved > 0).then(|| self.0.tags.lift(room_above(&start) + moved));
+        let buffer = &self.0.buffer;
+        for tag in start.tags() {
+            let lift = tag.name().is_some_and(|n| n.starts_with("lift-"));
+            if lift && Some(&tag) != want.as_ref() {
+                buffer.remove_tag(&tag, &start, &end);
+            }
+        }
+        if let Some(tag) = want
+            && !start.has_tag(&tag)
+        {
+            buffer.apply_tag(&tag, &start, &end);
         }
     }
 
@@ -3409,6 +4275,62 @@ impl Editor {
         self.line_start(first).offset() + before as i32
     }
 
+    /// Whether `rows`, a table written from line `first`, fit the window
+    /// without wrapping. A table lined up wider than that would wrap in
+    /// the middle of its padding, so it is left as typed. Its characters
+    /// are measured on its first line as drawn (whole pixels each would be
+    /// off by a column or two on a wide table).
+    fn table_fits(&self, first: usize, rows: &[String]) -> bool {
+        let view = &self.0.view;
+        let Some(start) = self.0.buffer.iter_at_line(first as i32) else {
+            return true;
+        };
+        let mut row_end = start;
+        if !row_end.ends_line() {
+            view.forward_display_line_end(&mut row_end);
+        }
+        let chars = row_end.offset() - start.offset();
+        let left = view.cursor_at(&start).x();
+        let room = view.visible_rect().width() - left;
+        if chars <= 0 || room <= 0 {
+            return true; // empty, or not laid out yet
+        }
+        let char_width = (view.cursor_at(&row_end).x() - left) as f64 / chars as f64;
+        // the table line's right margin
+        let room = room as f64 - 4.0 * view.zoom() as f64;
+        let widest = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0);
+        widest as f64 * char_width <= room
+    }
+
+    /// `markdown::format_table`, unless the table lined up would not fit
+    /// the window (see `table_fits`): then the rows stay as they are, and
+    /// a new row (`|`) gets one empty cell per column.
+    fn format_fitting(
+        &self,
+        first: usize,
+        rows: &[String],
+        at: Option<(usize, usize)>,
+    ) -> (Vec<String>, Option<usize>) {
+        let (formatted, offset) = markdown::format_table(rows, at);
+        if self.table_fits(first, &formatted) {
+            return (formatted, offset);
+        }
+        let cells = rows
+            .first()
+            .map_or(1, |r| markdown::table_cells(r).len().max(1));
+        let rows = rows
+            .iter()
+            .map(|r| {
+                if r == "|" {
+                    format!("|{}", "  |".repeat(cells))
+                } else {
+                    r.clone()
+                }
+            })
+            .collect();
+        (rows, at.map(|(_, column)| column))
+    }
+
     /// Lines the table up again soon after an edit in it.
     fn schedule_align(&self) {
         if std::mem::replace(&mut self.0.state.borrow_mut().align_pending, true) {
@@ -3440,7 +4362,7 @@ impl Editor {
         }
         let rows = self.line_texts(first, last);
         let at = Some((line - first, cursor.line_offset() as usize));
-        let (formatted, offset) = markdown::format_table(&rows, at);
+        let (formatted, offset) = self.format_fitting(first, &rows, at);
         if formatted == rows {
             return;
         }
@@ -3493,14 +4415,14 @@ impl Editor {
         };
         let rows = self.line_texts(first, last);
         let at = Some((line - first, cursor.line_offset() as usize));
-        let (mut formatted, offset) = markdown::format_table(&rows, at);
+        let (mut formatted, offset) = self.format_fitting(first, &rows, at);
         let step = markdown::table_step(&formatted, line - first, offset.unwrap_or(0), back);
         let (row, column) = match step {
             Some(step) => step,
             None if back => (line - first, offset.unwrap_or(0)),
             None => {
                 formatted.push("|".into());
-                formatted = markdown::format_table(&formatted, None).0;
+                formatted = self.format_fitting(first, &formatted, None).0;
                 (formatted.len() - 1, 2)
             }
         };
@@ -3540,7 +4462,7 @@ impl Editor {
         // under the head comes the rule first
         let new = (row + 1).max(2);
         rows.insert(new, "|".into());
-        let (formatted, _) = markdown::format_table(&rows, None);
+        let (formatted, _) = self.format_fitting(first, &rows, None);
         let before = self.models(first, last);
         let lines = self.table_lines(&formatted, &before);
         let cursor_after = self.row_offset(first, &lines, new) + 2;
@@ -3718,69 +4640,642 @@ impl Editor {
         true
     }
 
+    // -- word count -------------------------------------------------------------------
+
+    fn connect_word_count(&self) {
+        let wc = &self.0.word_count;
+        let weak = self.downgrade();
+        wc.switch.connect_active_notify(move |switch| {
+            let Some(editor) = upgrade(&weak) else { return };
+            let on = switch.is_active();
+            let counter = &editor.0.word_count.counter;
+            if counter.is_visible() == on {
+                return; // set from the config, not switched
+            }
+            counter.set_visible(on);
+            if on {
+                editor.recount();
+            }
+            if let Some(f) = &editor.0.callbacks.borrow().word_count {
+                f(on);
+            }
+        });
+        let weak = self.downgrade();
+        wc.counter.connect_clicked(move |_| {
+            if let Some(editor) = upgrade(&weak) {
+                editor.toggle_word_count_menu();
+            }
+        });
+        // counts follow the text once the typing pauses, while on show
+        let weak = self.downgrade();
+        self.0.buffer.connect_changed(move |_| {
+            let Some(editor) = upgrade(&weak) else { return };
+            let wc = &editor.0.word_count;
+            if !wc.counter.is_visible() && !wc.menu.is_visible() {
+                return;
+            }
+            if let Some(id) = editor.0.recount_timer.borrow_mut().take() {
+                id.remove();
+            }
+            let weak = editor.downgrade();
+            let id = glib::timeout_add_local_once(Duration::from_millis(250), move || {
+                if let Some(editor) = upgrade(&weak) {
+                    editor.0.recount_timer.borrow_mut().take();
+                    editor.recount();
+                }
+            });
+            editor.0.recount_timer.replace(Some(id));
+        });
+        // the window changed size: the menu stays above the counter
+        for adjustment in [self.0.view.vadjustment(), self.0.view.hadjustment()]
+            .into_iter()
+            .flatten()
+        {
+            let weak = self.downgrade();
+            adjustment.connect_notify_local(Some("page-size"), move |_, _| {
+                if let Some(editor) = upgrade(&weak)
+                    && editor.0.word_count.menu.is_visible()
+                {
+                    editor.place_word_count_menu();
+                    editor.0.word_count.menu.present();
+                }
+            });
+        }
+        // a click in the text closes the menu, as elsewhere in Kludd
+        let click = gtk::GestureClick::new();
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = self.downgrade();
+        click.connect_pressed(move |_, _, _, _| {
+            if let Some(editor) = upgrade(&weak) {
+                editor.0.word_count.menu.popdown();
+            }
+        });
+        self.0.view.add_controller(click);
+    }
+
+    /// Counts the note's words and characters again.
+    fn recount(&self) {
+        let text = self.text();
+        let markdown = !self.plain();
+        self.0.word_count.show(stats::count(&text, markdown));
+    }
+
+    /// Ctrl+Shift+C: opens the word count menu, or closes it.
+    pub fn toggle_word_count_menu(&self) {
+        let menu = &self.0.word_count.menu;
+        if menu.is_visible() {
+            menu.popdown();
+            return;
+        }
+        self.hide_toolbar();
+        self.recount();
+        self.place_word_count_menu();
+        menu.popup();
+    }
+
+    /// The word count menu goes above the counter's corner, bottom left.
+    fn place_word_count_menu(&self) {
+        let y = self.0.root.height() - 12;
+        let menu = &self.0.word_count.menu;
+        menu.set_pointing_to(Some(&gdk::Rectangle::new(24, y, 1, 1)));
+        menu.set_halign(gtk::Align::Start);
+    }
+
+    /// Closes the word count menu; false if it was not open.
+    pub fn close_word_count_menu(&self) -> bool {
+        let menu = &self.0.word_count.menu;
+        let open = menu.is_visible();
+        menu.popdown();
+        open
+    }
+
+    /// Whether the "x words" counter shows while typing (from the config).
+    pub fn set_word_count_shown(&self, on: bool) {
+        let wc = &self.0.word_count;
+        wc.counter.set_visible(on);
+        wc.switch.set_active(on);
+        if on {
+            self.recount();
+        }
+    }
+
+    /// The counter was switched on or off in the menu.
+    pub fn connect_word_count_shown(&self, f: impl Fn(bool) + 'static) {
+        self.0.callbacks.borrow_mut().word_count = Some(Box::new(f));
+    }
+
+    // -- find in the note -------------------------------------------------------------
+
+    fn connect_find(&self) {
+        let bar = &self.0.find;
+        let buffer = &self.0.buffer;
+        buffer.add_mark(&self.0.find_from, &buffer.start_iter());
+        let weak = self.downgrade();
+        bar.text.connect_changed(move |_| {
+            if let Some(editor) = upgrade(&weak) {
+                editor.refind(true);
+            }
+        });
+        let weak = self.downgrade();
+        bar.connect_step(move |step| {
+            if let Some(editor) = upgrade(&weak) {
+                editor.find_step(step);
+            }
+        });
+        let weak = self.downgrade();
+        bar.close.connect_clicked(move |_| {
+            if let Some(editor) = upgrade(&weak) {
+                editor.close_find();
+            }
+        });
+        // the text changed under the bar: the matches move with it
+        let weak = self.downgrade();
+        let pending = Rc::new(Cell::new(false));
+        self.0.buffer.connect_changed(move |_| {
+            let Some(editor) = upgrade(&weak) else { return };
+            if !editor.0.find.widget.is_visible() || pending.replace(true) {
+                return;
+            }
+            let weak = editor.downgrade();
+            let pending = pending.clone();
+            glib::idle_add_local_once(move || {
+                pending.set(false);
+                if let Some(editor) = upgrade(&weak) {
+                    editor.refind(false);
+                }
+            });
+        });
+    }
+
+    /// Ctrl+F: shows the find bar (with the selection in it, if it is a
+    /// few words on one line) and puts the keys there.
+    pub fn open_find(&self) {
+        let bar = &self.0.find;
+        let buffer = &self.0.buffer;
+        let selected = buffer
+            .selection_bounds()
+            .map(|(a, b)| buffer.text(&a, &b, true).to_string())
+            .filter(|t| !t.contains('\n') && t.chars().count() <= 100);
+        let from = buffer
+            .selection_bounds()
+            .map_or_else(|| buffer.iter_at_mark(&buffer.get_insert()), |(a, _)| a);
+        self.0.buffer.move_mark(&self.0.find_from, &from);
+        if !bar.widget.is_visible() {
+            bar.widget.set_visible(true);
+        }
+        self.hide_toolbar();
+        match selected {
+            Some(text) if bar.text.text() != text => bar.text.set_text(&text),
+            // the last search again: its matches show, but the cursor
+            // stays where it is until Enter goes to the next one from it
+            _ => {
+                self.refind(false);
+                self.0.view.imp().find_current.set(None);
+                let total = self.0.view.imp().finds.borrow().len();
+                bar.show_count(None, total);
+                self.0.view.queue_draw();
+            }
+        }
+        bar.text.grab_focus();
+        bar.text.select_region(0, -1);
+    }
+
+    /// Closes the find bar and goes back to the text, at the match last
+    /// gone to. Returns false if it was not open.
+    pub fn close_find(&self) -> bool {
+        if !self.hide_find() {
+            return false;
+        }
+        self.0.view.grab_focus();
+        true
+    }
+
+    /// Hides the find bar and its matches; false if it was not open.
+    fn hide_find(&self) -> bool {
+        let bar = &self.0.find;
+        if !bar.widget.is_visible() {
+            return false;
+        }
+        bar.widget.set_visible(false);
+        let view = self.0.view.imp();
+        view.finds.borrow_mut().clear();
+        view.find_current.set(None);
+        self.0.view.queue_draw();
+        true
+    }
+
+    /// Finds the bar's text in the note again. With `jump` (the text in the
+    /// bar changed), goes to the first match from where finding started.
+    fn refind(&self, jump: bool) {
+        let bar = &self.0.find;
+        let buffer = &self.0.buffer;
+        let query = bar.text.text();
+        let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+        let finds = self.find_in(&text, &query);
+        let from = buffer.iter_at_mark(&self.0.find_from).offset();
+        let current = (!finds.is_empty()).then(|| {
+            let after = finds.partition_point(|&(a, _)| a < from);
+            if after < finds.len() { after } else { 0 }
+        });
+        bar.show_count(current, finds.len());
+        let target = current.map(|c| finds[c].0);
+        let view = self.0.view.imp();
+        view.finds.replace(finds);
+        view.find_current.set(current);
+        if jump && let Some(offset) = target {
+            // what edits before it move along, as after a step
+            buffer.move_mark(&self.0.find_from, &buffer.iter_at_offset(offset));
+            self.go_to_find(offset);
+        }
+        self.0.view.queue_draw();
+    }
+
+    /// Where `query` is in the note: in its text as shown (`[the docs]
+    /// (url)` reads "the docs", so "see the docs" is found across the
+    /// hidden `[`), and in all of it, hidden syntax too (a link's
+    /// address). In order, never overlapping.
+    fn find_in(&self, text: &str, query: &str) -> Vec<(i32, i32)> {
+        let mut finds: Vec<(i32, i32)> = find::find_all(text, query)
+            .into_iter()
+            .map(|(a, b)| (a as i32, b as i32))
+            .collect();
+        // the text as read: without its syntax, hidden or (where the
+        // cursor is, going to a match puts it there) shown faintly, nor
+        // the room kept around a code span
+        let tags = &self.0.tags;
+        let buffer = &self.0.buffer;
+        let mut hidden = Vec::new();
+        for tag in [&tags.conceal, &tags.syntax, &tags.pad] {
+            let mut iter = buffer.start_iter();
+            if !iter.has_tag(tag) && !iter.forward_to_tag_toggle(Some(tag)) {
+                continue;
+            }
+            while !iter.is_end() {
+                let start = iter.offset();
+                iter.forward_to_tag_toggle(Some(tag));
+                hidden.push((start, iter.offset()));
+                if !iter.forward_to_tag_toggle(Some(tag)) {
+                    break;
+                }
+            }
+        }
+        hidden.sort_unstable();
+        if !hidden.is_empty() {
+            let mut shown = String::with_capacity(text.len());
+            let mut offsets: Vec<i32> = Vec::with_capacity(text.len());
+            let mut gaps = hidden.iter().peekable();
+            for (i, c) in text.chars().enumerate() {
+                let i = i as i32;
+                while gaps.peek().is_some_and(|&&(_, end)| end <= i) {
+                    gaps.next();
+                }
+                if gaps.peek().is_some_and(|&&(start, _)| start <= i) {
+                    continue;
+                }
+                shown.push(c);
+                offsets.push(i);
+            }
+            for (a, b) in find::find_all(&shown, query) {
+                finds.push((offsets[a], offsets[b - 1] + 1));
+            }
+            finds.sort_unstable();
+            let mut kept: Vec<(i32, i32)> = Vec::with_capacity(finds.len());
+            for found in finds {
+                if kept.last().is_none_or(|&(_, end)| found.0 >= end) {
+                    kept.push(found);
+                }
+            }
+            finds = kept;
+        }
+        finds
+    }
+
+    /// Next (`step` 1) or previous (-1) match, round at the ends.
+    fn find_step(&self, step: i32) {
+        let view = self.0.view.imp();
+        let total = view.finds.borrow().len();
+        if total == 0 {
+            return;
+        }
+        // none gone to yet: the first after the cursor (or before it)
+        let from = {
+            let buffer = &self.0.buffer;
+            buffer.iter_at_mark(&self.0.find_from).offset()
+        };
+        let current = match view.find_current.get() {
+            Some(c) => (c as i32 + step).rem_euclid(total as i32) as usize,
+            None => {
+                let after = view.finds.borrow().partition_point(|&(a, _)| a < from);
+                if step > 0 {
+                    after % total
+                } else {
+                    (after + total - 1) % total
+                }
+            }
+        };
+        view.find_current.set(Some(current));
+        let offset = view.finds.borrow()[current].0;
+        let buffer = &self.0.buffer;
+        buffer.move_mark(&self.0.find_from, &buffer.iter_at_offset(offset));
+        self.0.find.show_count(Some(current), total);
+        self.go_to_find(offset);
+        self.0.view.queue_draw();
+    }
+
+    /// Puts the cursor on a match (its hidden syntax shows) and scrolls it
+    /// into view, clear of the edges.
+    fn go_to_find(&self, offset: i32) {
+        let buffer = &self.0.buffer;
+        buffer.place_cursor(&buffer.iter_at_offset(offset));
+        let mark = buffer.get_insert();
+        self.0.view.scroll_to_mark(&mark, 0.2, false, 0.0, 0.0);
+    }
+
     // -- links ---------------------------------------------------------------------
 
-    /// Ctrl+click opens a link; with Ctrl held, the pointer shows where.
-    /// A click on a task's box ticks it.
+    /// A click opens a link (on release, so a press dragged away opens
+    /// nothing; a double-click opens it once); the pointer shows where. A
+    /// link being edited (the cursor is in it, its syntax shown) takes
+    /// clicks like text, unless Ctrl is held. A click on a task's box
+    /// ticks it.
     fn connect_links(&self) {
         let click = gtk::GestureClick::builder()
             .button(gdk::BUTTON_PRIMARY)
             .propagation_phase(gtk::PropagationPhase::Capture)
             .build();
+        // the link pressed on, and whether the last click opened one
+        let pressed: Rc<RefCell<Option<String>>> = Rc::default();
+        let opened = Rc::new(Cell::new(false));
+        // where a press on a link was, and once it is dragged (no click,
+        // then), where the selection it drags out starts; the drag below
+        let press_at: Rc<Cell<Option<i32>>> = Rc::default();
+        let drag_from: Rc<Cell<Option<i32>>> = Rc::default();
         let weak = self.downgrade();
-        click.connect_pressed(move |gesture, _, x, y| {
+        let (pending, just_opened) = (pressed.clone(), opened.clone());
+        let (pressed_at, dragged) = (press_at.clone(), drag_from.clone());
+        click.connect_pressed(move |gesture, presses, x, y| {
             let Some(editor) = upgrade(&weak) else { return };
-            let ctrl = gesture
-                .current_event_state()
-                .contains(gdk::ModifierType::CONTROL_MASK);
-            if let Some(url) = editor.link_at(x, y).filter(|_| ctrl) {
+            pending.replace(None);
+            dragged.set(None);
+            // the second click of a double-click on a link: it is open
+            // already, and what it opened must not get a click
+            if presses > 1 && just_opened.get() {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
-                editor.open_link(&url);
+                return;
+            }
+            just_opened.set(false);
+            let state = gesture.current_event_state();
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+            if let Some(url) = editor
+                .link_at(x, y, ctrl)
+                .filter(|_| !shift && presses == 1)
+            {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                pending.replace(Some(url));
+                pressed_at.set(editor.offset_at(x, y));
             } else if let Some(line) = editor.task_at(x, y).filter(|_| !editor.plain()) {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 editor.toggle_task(line);
+            } else if !shift && presses == 1 {
+                editor.fix_click_past_end(x, y);
             }
+        });
+        // opens the link pressed on, unless the press became a drag
+        let open = {
+            let weak = self.downgrade();
+            let pending = pressed.clone();
+            Rc::new(move || {
+                if let Some(editor) = upgrade(&weak)
+                    && let Some(url) = pending.take()
+                {
+                    opened.set(true);
+                    editor.open_link(&url);
+                }
+            })
+        };
+        let open_now = open.clone();
+        click.connect_released(move |_, _, _, _| open_now());
+        // a press held past the double-click time stops the click gesture
+        // (no release comes then): the drag gesture, which does not time
+        // out, opens it on release instead
+        // a press on a link that is dragged selects, as anywhere else in
+        // the text (in the click's group, it sees the press it claimed)
+        let drag = gtk::GestureDrag::builder()
+            .button(gdk::BUTTON_PRIMARY)
+            .propagation_phase(gtk::PropagationPhase::Capture)
+            .build();
+        drag.group_with(&click);
+        let weak = self.downgrade();
+        let dragging = drag_from.clone();
+        let pending = pressed.clone();
+        drag.connect_drag_update(move |drag, dx, dy| {
+            let Some(editor) = upgrade(&weak) else { return };
+            if dragging.get().is_none() {
+                let far = dx * dx + dy * dy > 6.0 * 6.0;
+                if !far || pending.borrow().is_none() {
+                    return;
+                }
+                pending.replace(None);
+                dragging.set(press_at.take());
+            }
+            if let (Some(from), Some((x, y))) = (dragging.get(), drag.start_point()) {
+                editor.drag_select(from, x + dx, y + dy);
+            }
+        });
+        drag.connect_drag_end(move |_, _, _| {
+            drag_from.set(None);
+            open();
+        });
+        // taken by another gesture: open nothing
+        drag.connect_cancel(move |_, _| {
+            pressed.replace(None);
         });
         self.0.view.add_controller(click);
+        self.0.view.add_controller(drag);
 
-        let motion = gtk::EventControllerMotion::new();
-        let weak = self.downgrade();
-        let on_link = Cell::new(false);
-        motion.connect_motion(move |motion, x, y| {
-            let Some(editor) = upgrade(&weak) else { return };
-            let ctrl = motion
-                .current_event_state()
-                .contains(gdk::ModifierType::CONTROL_MASK);
-            let over = (ctrl && editor.link_at(x, y).is_some()) || editor.task_at(x, y).is_some();
-            if on_link.replace(over) != over {
-                let cursor = if over { "pointer" } else { "text" };
-                editor.0.view.set_cursor_from_name(Some(cursor));
+        // the hand over what a click opens; it changes when the pointer
+        // moves, and when the cursor does (into a link, say)
+        let pointer: Rc<Cell<Option<(f64, f64, bool)>>> = Rc::default();
+        let on_link = Rc::new(Cell::new(false));
+        let update = {
+            let weak = self.downgrade();
+            let pointer = pointer.clone();
+            move || {
+                let Some(editor) = upgrade(&weak) else { return };
+                let over = pointer.get().is_some_and(|(x, y, ctrl)| {
+                    editor.link_at(x, y, ctrl).is_some() || editor.task_at(x, y).is_some()
+                });
+                if on_link.replace(over) != over {
+                    let cursor = if over { "pointer" } else { "text" };
+                    editor.0.view.set_cursor_from_name(Some(cursor));
+                }
             }
+        };
+        // run once GTK has laid the text out again (asked during a scroll,
+        // before that, its own lookups fail)
+        let update: Rc<dyn Fn()> = {
+            let update = Rc::new(update);
+            let queued = Rc::new(Cell::new(false));
+            Rc::new(move || {
+                if queued.replace(true) {
+                    return;
+                }
+                let (update, queued) = (update.clone(), queued.clone());
+                glib::idle_add_local_full(glib::Priority::LOW, move || {
+                    queued.set(false);
+                    update();
+                    glib::ControlFlow::Break
+                });
+            })
+        };
+        let motion = gtk::EventControllerMotion::new();
+        let (at, changed) = (pointer.clone(), update.clone());
+        motion.connect_motion(move |motion, x, y| {
+            let state = motion.current_event_state();
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            at.set(Some((x, y, ctrl)));
+            changed();
+        });
+        let changed = update.clone();
+        motion.connect_leave(move |_| {
+            pointer.set(None);
+            changed();
         });
         self.0.view.add_controller(motion);
+        // the text moved under a still pointer
+        if let Some(adjustment) = self.0.view.vadjustment() {
+            let update = update.clone();
+            adjustment.connect_value_changed(move |_| update());
+        }
+        // once the cursor has settled (typing moves it on every key)
+        let weak = self.downgrade();
+        let queued = Rc::new(Cell::new(false));
+        self.0.buffer.connect_mark_set(move |_, _, mark| {
+            let Some(editor) = upgrade(&weak) else { return };
+            if *mark != editor.0.buffer.get_insert() || queued.replace(true) {
+                return;
+            }
+            let (update, queued) = (update.clone(), queued.clone());
+            glib::idle_add_local_once(move || {
+                queued.set(false);
+                update();
+            });
+        });
     }
 
-    /// The link (or picture, or footnote) under a point of the view.
-    fn link_at(&self, x: f64, y: f64) -> Option<String> {
+    /// A click right of a line's end puts the cursor there. GTK puts it
+    /// inside hidden syntax instead when the line ends in a link, and the
+    /// next letter typed would break the link.
+    fn fix_click_past_end(&self, x: f64, y: f64) {
         let view = &self.0.view;
         let (bx, by) =
             view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
-        let iter = view.iter_at_location(bx, by)?;
+        let Some(end) = view.past_line_end(bx, by) else {
+            return;
+        };
+        let offset = end.offset();
+        // once GTK has placed it, unless the press became a selection
+        let weak = self.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(editor) = upgrade(&weak)
+                && !editor.0.buffer.has_selection()
+            {
+                let buffer = &editor.0.buffer;
+                buffer.place_cursor(&buffer.iter_at_offset(offset));
+            }
+        });
+    }
+
+    /// The buffer offset of the character at a point of the view, if any.
+    fn offset_at(&self, x: f64, y: f64) -> Option<i32> {
+        let view = &self.0.view;
+        let (bx, by) =
+            view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
         let tags = &self.0.tags;
-        if !iter.has_tag(&tags.link) && !iter.has_tag(&tags.footnote) {
+        let iter = view
+            .char_at(bx, by, &[&tags.link, &tags.footnote, &tags.table_line])
+            .or_else(|| view.char_at(bx, by, &[]))?;
+        Some(iter.offset())
+    }
+
+    /// Selects from `from` to a point of the view, for a drag that started
+    /// on a link (GTK's own selecting never saw its press).
+    fn drag_select(&self, from: i32, x: f64, y: f64) {
+        let view = &self.0.view;
+        let (bx, by) =
+            view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+        let to = view.char_at(bx, by, &[]).unwrap_or_else(|| {
+            // beside the text: the start or the end of the line there
+            let (mut line, _) = view.line_at_y(by);
+            if bx > view.cursor_at(&line).x() && !line.ends_line() {
+                line.forward_to_line_end();
+            }
+            line
+        });
+        let buffer = &self.0.buffer;
+        buffer.select_range(&to, &buffer.iter_at_offset(from));
+        // dragged past the edge: the text follows
+        view.scroll_mark_onscreen(&buffer.get_insert());
+    }
+
+    /// The link (or picture, or footnote) a click at a point of the view
+    /// opens: none on a link being edited (a cursor in or right next to
+    /// it, so its syntax shows), unless `ctrl`.
+    fn link_at(&self, x: f64, y: f64, ctrl: bool) -> Option<String> {
+        let view = &self.0.view;
+        let (bx, by) =
+            view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+        let tags = &self.0.tags;
+        let iter = view.char_at(bx, by, &[&tags.link, &tags.footnote, &tags.table_line])?;
+        self.link_to_open(&iter, ctrl)
+    }
+
+    /// The link (or picture, or footnote) a click on `iter` opens, as in
+    /// `link_at`.
+    fn link_to_open(&self, iter: &gtk::TextIter, ctrl: bool) -> Option<String> {
+        let tags = &self.0.tags;
+        let n = iter.line() as usize;
+        // a table shows its Markdown, links too: they have no link tag
+        let table = self.0.view.block(n).is_table();
+        // the shown Markdown of a link being edited counts too, for Ctrl
+        let syntax = ctrl && iter.has_tag(&tags.syntax);
+        if !table && !syntax && !iter.has_tag(&tags.link) && !iter.has_tag(&tags.footnote) {
             return None;
         }
         let offset = iter.line_offset() as usize;
         let item = self
-            .line_inlines(&self.line_model(iter.line() as usize))
+            .line_inlines(&self.line_model(n))
             .into_iter()
             .find(|i| {
                 matches!(
                     i.kind,
                     InlineKind::Link | InlineKind::Url | InlineKind::Image | InlineKind::Footnote
-                ) && i.text.contains(&offset)
+                ) && i.whole.contains(&offset)
             })?;
-        let line = self.line_model(iter.line() as usize).text();
+        if !ctrl {
+            // a table shows its Markdown all the time: it is always edited
+            let buffer = &self.0.buffer;
+            let editing = table
+                || [buffer.get_insert(), buffer.selection_bound()]
+                    .iter()
+                    .map(|mark| buffer.iter_at_mark(mark))
+                    .filter(|c| c.line() as usize == n)
+                    .any(|c| {
+                        let c = c.line_offset() as usize;
+                        // a bare URL shows no Markdown: only a cursor inside
+                        // it edits it, not one right after it
+                        if item.kind == InlineKind::Url {
+                            item.whole.start < c && c < item.whole.end
+                        } else {
+                            (item.whole.start..=item.whole.end).contains(&c)
+                        }
+                    });
+            if editing {
+                return None;
+            }
+        }
+        let line = self.line_model(n).text();
         Some(match item.kind {
             InlineKind::Footnote => {
                 let label: String = line
@@ -3800,6 +5295,10 @@ impl Editor {
     fn open_link(&self, url: &str) {
         if let Some(label) = url.strip_prefix("[^").and_then(|l| l.strip_suffix(']')) {
             self.go_to_footnote(label);
+            return;
+        }
+        if let Some(anchor) = url.strip_prefix('#') {
+            self.go_to_heading(anchor);
             return;
         }
         let window = self.0.view.root().and_downcast::<gtk::Window>();
@@ -3825,11 +5324,15 @@ impl Editor {
         if note {
             // after this click is done with: opening swaps the whole buffer
             let weak = self.downgrade();
+            let anchor = url.split_once('#').map(|(_, a)| a.to_string());
             glib::idle_add_local_once(move || {
-                if let Some(editor) = upgrade(&weak)
-                    && let Some(f) = &editor.0.callbacks.borrow().open_file
-                {
+                let Some(editor) = upgrade(&weak) else { return };
+                if let Some(f) = &editor.0.callbacks.borrow().open_file {
                     f(path);
+                }
+                // `other.md#section`: then to the section
+                if let Some(anchor) = anchor.filter(|a| !a.is_empty()) {
+                    editor.go_to_heading(&anchor);
                 }
             });
         } else {
@@ -3884,6 +5387,57 @@ impl Editor {
                 }
             });
         }
+    }
+
+    /// A `#section` link: goes to the heading GitHub gives that anchor
+    /// (`## Install it` is `#install-it`; a second one is `-1`).
+    fn go_to_heading(&self, anchor: &str) {
+        let wanted = percent_decode(anchor).to_lowercase();
+        // `#` and `#top` go to the top, as on GitHub
+        let top = (wanted.is_empty() || wanted == "top").then_some(0);
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let found = top.or_else(|| {
+            (0..self.line_count()).find(|&n| {
+                let line = self.line_model(n);
+                // `# x`, and text underlined with `===` or `---`
+                let setext = matches!(self.0.view.block(n), Block::SetextText { .. });
+                if line.kind.heading_level().is_none() && !setext {
+                    return false;
+                }
+                // as read: a link in it is its text, `<sub>` and such go;
+                // read as a heading, or `1. Start` would be a list item
+                let text = if setext {
+                    markdown::searchable(&line.text())
+                } else {
+                    markdown::searchable(&format!("# {}", line.text()))
+                };
+                let slug = heading_anchor(&text);
+                let count = seen.entry(slug.clone()).or_insert(0);
+                let id = if *count == 0 {
+                    slug
+                } else {
+                    format!("{slug}-{count}")
+                };
+                *count += 1;
+                id == wanted
+            })
+        });
+        let Some(n) = found else {
+            self.emit_error(format!("no heading for #{anchor}"));
+            return;
+        };
+        let at = self.line_start(n).offset();
+        // after this click is done with, or GTK puts the cursor at it; the
+        // heading goes to the top, its section under it
+        let weak = self.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(editor) = upgrade(&weak) {
+                editor.place_cursor(at);
+                let insert = editor.0.buffer.get_insert();
+                editor.0.view.scroll_to_mark(&insert, 0.0, true, 0.0, 0.0);
+                editor.0.view.grab_focus();
+            }
+        });
     }
 
     // -- pictures ------------------------------------------------------------------
@@ -4446,8 +6000,9 @@ impl Editor {
     }
 
     /// Pressing inside the selection would start dragging the text (which
-    /// drops its formatting and leaves the toolbar stuck): collapse the
-    /// selection at the click instead, so a drag selects anew.
+    /// drops its formatting and its Markdown, and leaves the toolbar
+    /// stuck): collapse the selection at the click instead, so a drag
+    /// selects anew.
     fn no_drag_and_drop(&self, event: &gdk::Event) {
         let Some(button) = event.downcast_ref::<gdk::ButtonEvent>() else {
             return;
@@ -4459,7 +6014,7 @@ impl Editor {
         {
             return;
         }
-        let Some((start, end)) = self.0.buffer.selection_bounds() else {
+        let Some((start, _)) = self.0.buffer.selection_bounds() else {
             return;
         };
         let view = &self.0.view;
@@ -4473,12 +6028,11 @@ impl Editor {
         };
         let (bx, by) =
             view.window_to_buffer_coords(gtk::TextWindowType::Widget, p.x() as i32, p.y() as i32);
-        if let Some(iter) = view.iter_at_location(bx, by)
-            && iter >= start
-            && iter < end
-        {
-            self.0.buffer.place_cursor(&iter);
-        }
+        // GTK finds the press inside the selection in more places than
+        // `char_at` does (the room between lines): any press collapses it,
+        // and GTK then puts the cursor where it lands
+        let iter = view.char_at(bx, by, &[]).unwrap_or(start);
+        self.0.buffer.place_cursor(&iter);
     }
 
     /// Shows the toolbar again if there is a selection (say, after the
@@ -4646,6 +6200,7 @@ impl Editor {
         buffer.place_cursor(&buffer.end_iter());
         self.scroll_to_cursor();
         self.emit_status();
+        self.recount();
         Ok(())
     }
 
@@ -4674,6 +6229,8 @@ impl Editor {
     /// Saves and forgets the current note. A note created this session and
     /// left empty is removed again (it holds nothing worth a trash entry).
     pub fn close(&self) {
+        self.hide_find();
+        self.0.word_count.menu.popdown();
         self.hide_toolbar();
         self.save_sync();
         let doc = self.0.state.borrow_mut().doc.take();
@@ -4929,6 +6486,20 @@ fn truncate_spans(spans: &mut Vec<Span>, at: usize) {
     *spans = split_spans(spans, at).0;
 }
 
+/// The anchor GitHub gives a heading: lower case, spaces to `-`, other
+/// punctuation left out (`Pattern 1: Weekly!` -> `pattern-1-weekly`).
+fn heading_anchor(text: &str) -> String {
+    text.trim()
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter_map(|c| match c {
+            ' ' => Some('-'),
+            c if c.is_alphanumeric() || c == '-' || c == '_' => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A link with a scheme (`https:`, `mailto:`) rather than a path.
 fn has_scheme(url: &str) -> bool {
     url.split_once(':').is_some_and(|(s, _)| {
@@ -4987,6 +6558,16 @@ mod tests {
                 Span::new(" world", Style::NONE)
             ]
         );
+    }
+
+    #[test]
+    fn heading_anchors_like_github() {
+        assert_eq!(heading_anchor("Install"), "install");
+        assert_eq!(
+            heading_anchor("Pattern 1: Weekly is the new monthly!"),
+            "pattern-1-weekly-is-the-new-monthly"
+        );
+        assert_eq!(heading_anchor("Hyprland setup"), "hyprland-setup");
     }
 
     #[test]
@@ -5420,6 +7001,156 @@ mod tests {
             editor.text(),
             "# Links\nSee [the docs](https://x.y), `code` and https://kludd.dev\n"
         );
+        // a click opens a link, but one being edited takes clicks like
+        // text (Ctrl+click still opens it)
+        let open = |needle: &str, ctrl: bool| editor.link_to_open(&at(needle), ctrl);
+        assert_eq!(open("the docs", false), None, "being edited");
+        assert_eq!(open("the docs", true).as_deref(), Some("https://x.y"));
+        assert_eq!(
+            open("kludd.dev", false).as_deref(),
+            Some("https://kludd.dev")
+        );
+        assert_eq!(open("code", false), None, "not a link");
+        editor.place_cursor(find(&editor, "See"));
+        assert_eq!(open("the docs", false).as_deref(), Some("https://x.y"));
+        editor.place_cursor(find(&editor, ", `code`"));
+        assert_eq!(open("the docs", false), None, "cursor right after it");
+        // a `#section` link goes to its heading
+        assert_eq!(editor.line_model(0).text(), "Links");
+        editor.open_link("#links");
+        glib::MainContext::default().iteration(false);
+        while glib::MainContext::default().iteration(false) {}
+        let buffer = &editor.0.buffer;
+        assert_eq!(
+            buffer.iter_at_mark(&buffer.get_insert()).offset(),
+            0,
+            "at the heading"
+        );
+        // a bare URL shows no Markdown to edit: right after it, it opens
+        editor.place_cursor(find(&editor, "kludd.dev") + 9);
+        assert_eq!(
+            open("kludd.dev", false).as_deref(),
+            Some("https://kludd.dev")
+        );
+        editor.place_cursor(find(&editor, "kludd.dev") + 2);
+        assert_eq!(open("kludd.dev", false), None, "cursor inside it");
+
+        // Ctrl+F: finds in the note, from the cursor on, round at the end
+        let finds = || editor.0.view.imp().finds.borrow().clone();
+        let cursor = || {
+            let buffer = &editor.0.buffer;
+            buffer.iter_at_mark(&buffer.get_insert()).offset()
+        };
+        editor.place_cursor(find(&editor, "code"));
+        editor.open_find();
+        editor.0.find.text.set_text("HTTPS");
+        let (docs, dev) = (find(&editor, "https://x"), find(&editor, "https://k"));
+        assert_eq!(finds(), [(docs, docs + 5), (dev, dev + 5)], "any case");
+        assert_eq!(cursor(), dev, "the first match after the cursor");
+        editor.find_step(1);
+        assert_eq!(cursor(), docs, "round to the first");
+        editor.find_step(-1);
+        assert_eq!(cursor(), dev);
+        type_text(&editor, "x");
+        glib::MainContext::default().iteration(false);
+        while glib::MainContext::default().iteration(false) {}
+        assert_eq!(finds().len(), 2, "follows the text as it changes");
+        editor.undo();
+        // what is shown is found too: across a link's hidden `[`
+        editor.place_cursor(0);
+        editor.0.find.text.set_text("see the docs");
+        let see = find(&editor, "See [");
+        assert_eq!(finds(), [(see, see + 13)], "across hidden syntax");
+        assert!(editor.close_find());
+        assert!(finds().is_empty() && !editor.close_find());
+        editor.close();
+
+        // GTK aborts on a point in the room below a line with hidden text:
+        // a heading's room below moves to the top of the next line
+        editor.new_note(&dir);
+        editor.paste("Rooms\n\n## See [the docs](https://x.y)\n\nNext line\n");
+        editor.place_cursor(0);
+        let line_tags = |n: usize| -> Vec<String> {
+            editor
+                .line_start(n)
+                .tags()
+                .iter()
+                .filter_map(|t| t.name().map(|n| n.to_string()))
+                .collect()
+        };
+        let heading = (0..editor.line_count())
+            .find(|&n| editor.line_model(n).text().starts_with("See"))
+            .unwrap();
+        assert!(line_tags(heading).iter().any(|t| t == "no-below"));
+        assert!(
+            line_tags(heading + 1)
+                .iter()
+                .any(|t| t.starts_with("lift-"))
+        );
+        // shown (the cursor in it), it has its room below again
+        editor.place_cursor(find(&editor, "docs"));
+        assert!(!line_tags(heading).iter().any(|t| t == "no-below"));
+        assert!(
+            !line_tags(heading + 1)
+                .iter()
+                .any(|t| t.starts_with("lift-"))
+        );
+        editor.close();
+
+        // which way each character reads, for measuring mixed lines
+        editor.new_note(&dir);
+        editor.paste("Dirs\n\nGo שלום עולם now 12\n\nשלום abc ١٢٣ סוף\n");
+        let directions = |needle: &str| {
+            let n = (0..editor.line_count())
+                .find(|&n| editor.line_model(n).text().contains(needle))
+                .unwrap();
+            let (start, end) = (editor.line_start(n), editor.line_content_end(n));
+            let dirs = editor.0.view.line_directions(&start, &end).unwrap();
+            let text: String = start.visible_text(&end).into();
+            let ways: String = dirs
+                .chars
+                .iter()
+                .map(|(_, rtl)| if *rtl { 'R' } else { 'L' })
+                .collect();
+            (dirs.base, text, ways)
+        };
+        // the spaces between Hebrew words are Hebrew's; digits read left
+        // to right, and the space before Arabic ones counts as the line's
+        let (base, text, ways) = directions("Go");
+        assert_eq!((base, text.as_str()), (false, "Go שלום עולם now 12"));
+        assert_eq!(ways, "LLLRRRRRRRRRLLLLLLL");
+        let (base, text, ways) = directions("abc");
+        assert_eq!((base, text.as_str()), (true, "שלום abc ١٢٣ סוף"));
+        assert_eq!(ways, "RRRRRLLLRLLLRRRR");
+        assert!(!is_rtl('١') && is_rtl('ש'));
+        editor.close();
+
+        // a setext rule is hidden whole: the room goes past it
+        let setext = dir.join("setext.md");
+        std::fs::write(
+            &setext,
+            "Setext with [a link](https://s.com)\n====\n\nAfter it\n",
+        )
+        .unwrap();
+        editor.open(&setext, false).unwrap();
+        editor.place_cursor(editor.text().chars().count() as i32);
+        let title = (0..editor.line_count())
+            .find(|&n| editor.line_model(n).text().starts_with("Setext"))
+            .unwrap();
+        assert!(line_tags(title).iter().any(|t| t == "no-below"));
+        assert!(editor.0.view.hidden_whole(&editor.line_start(title + 1)));
+        assert!(line_tags(title + 2).iter().any(|t| t.starts_with("lift-")));
+        editor.close();
+
+        // an empty last line, which takes no tags, is lifted by the view
+        editor.new_note(&dir);
+        editor.paste("Rooms\n\n# Final [link](https://x.com)\n");
+        editor.place_cursor(editor.text().chars().count() as i32);
+        let lifted = editor.0.view.pixels_above_lines();
+        assert!(lifted > 0, "{lifted}");
+        assert_eq!(editor.0.view.bottom_margin(), 0);
+        type_text(&editor, "x");
+        assert_eq!(editor.0.view.pixels_above_lines(), 0);
         editor.close();
 
         // numbered lists, tasks, quotes and deeper headings: started by

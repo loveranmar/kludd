@@ -17,6 +17,8 @@ pub struct Config {
     pub theme: String,
     /// Editor zoom factor, changed with Ctrl +/-.
     pub zoom: f64,
+    /// "x words" in the editor's corner while typing (Ctrl+Shift+C).
+    pub word_count: bool,
     /// Other folders whose notes Kludd lists, each in its own view. Last:
     /// TOML writes them as `[[folders]]` tables, after the plain values.
     pub folders: Vec<Folder>,
@@ -71,6 +73,7 @@ impl Default for Config {
             notes_dir: "~/Kludd".into(),
             theme: "pink".into(),
             zoom: 1.0,
+            word_count: false,
             folders: Vec::new(),
         }
     }
@@ -170,6 +173,7 @@ mod tests {
             notes_dir: "/tmp/notes".into(),
             theme: "dark".into(),
             zoom: 1.25,
+            word_count: true,
             folders: vec![
                 Folder::new("~/code/app/docs".into()),
                 Folder {

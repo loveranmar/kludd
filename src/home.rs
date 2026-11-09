@@ -1,5 +1,6 @@
 //! Home view: header, search field, the added folders and the grid of note
-//! cards. Inside an added folder it lists that folder's notes instead.
+//! cards. Inside an added folder it lists that folder's notes instead, and
+//! the folders in it that have notes.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -40,6 +41,8 @@ enum Target {
 struct Inner {
     root: gtk::Box,
     back: gtk::Button,
+    /// Where the back button goes: "My notes", or the folder above.
+    back_label: gtk::Label,
     title: gtk::Label,
     add_button: gtk::Button,
     empty: gtk::Label,
@@ -57,9 +60,13 @@ struct Inner {
     tints: Vec<(Option<&'static str>, gtk::Button)>,
     menu_button: gtk::Button,
     menu_target: RefCell<Option<Target>>,
-    /// Showing an added folder: its notes are listed, the folders are not.
+    /// Showing an added folder (or a folder in one): its notes are listed,
+    /// and its folders that have notes instead of the added ones.
     in_folder: Cell<bool>,
+    /// The folder cards on show, in order.
     folders: RefCell<Vec<Folder>>,
+    /// The added folders, shown outside of them.
+    added: RefCell<Vec<Folder>>,
     notes: RefCell<Vec<Note>>,
     callbacks: RefCell<Callbacks>,
 }
@@ -78,7 +85,8 @@ impl Home {
         let back_icon = Icon::new(theme::ICON_ARROW_LEFT, 14);
         back_icon.add_css_class("back-icon");
         back_box.append(&back_icon);
-        back_box.append(&gtk::Label::new(Some("My notes")));
+        let back_label = gtk::Label::new(Some("My notes"));
+        back_box.append(&back_label);
         let back = gtk::Button::builder()
             .child(&back_box)
             .halign(gtk::Align::Start)
@@ -204,6 +212,7 @@ impl Home {
         let home = Home(Rc::new(Inner {
             root,
             back,
+            back_label,
             title,
             add_button,
             empty,
@@ -222,6 +231,7 @@ impl Home {
             menu_target: RefCell::new(None),
             in_folder: Cell::new(false),
             folders: RefCell::new(Vec::new()),
+            added: RefCell::new(Vec::new()),
             notes: RefCell::new(Vec::new()),
             callbacks: RefCell::new(Callbacks::default()),
         }));
@@ -407,6 +417,10 @@ impl Home {
             Some(Target::Note(notes.get(index)?.path.clone()))
         });
         home.connect_menu(&home.0.folders_grid, |home, index| {
+            // a folder inside an added one is not Kludd's to remove
+            if home.0.in_folder.get() {
+                return None;
+            }
             let folders = home.0.folders.borrow();
             Some(Target::Folder(folders.get(index)?.dir()))
         });
@@ -433,7 +447,7 @@ impl Home {
                 .folders
                 .borrow()
                 .get(child.index() as usize)
-                .is_none_or(|f| folder_matches(&f.dir(), &query))
+                .is_none_or(|f| home.folder_hit(&f.dir(), &query))
         });
         let weak = Rc::downgrade(&home.0);
         home.0.search.connect_changed(move |_| {
@@ -550,16 +564,18 @@ impl Home {
         let folders = self.visible_folders();
         self.0.folders_grid.set_visible(folders > 0);
         // folder cards that match are an answer to the search too
-        let show = count == 0 && (folders == 0 || self.query().is_empty());
+        let show = count == 0 && folders == 0;
         let empty = &self.0.empty;
         if show {
-            empty.set_text(if !self.0.notes.borrow().is_empty() {
-                "Nothing matches your search."
-            } else if self.0.in_folder.get() {
-                "No notes here yet. Press + to start one."
-            } else {
-                "No notes yet. Press + to start one."
-            });
+            empty.set_text(
+                if !self.0.notes.borrow().is_empty() || !self.query().is_empty() {
+                    "Nothing matches your search."
+                } else if self.0.in_folder.get() {
+                    "No notes here yet. Press + to start one."
+                } else {
+                    "No notes yet. Press + to start one."
+                },
+            );
         }
         empty.set_visible(show);
         if let Some(f) = &self.0.callbacks.borrow().count {
@@ -578,16 +594,24 @@ impl Home {
     }
 
     fn visible_folders(&self) -> usize {
-        if self.0.in_folder.get() {
-            return 0;
-        }
         let query = self.query();
         self.0
             .folders
             .borrow()
             .iter()
-            .filter(|f| folder_matches(&f.dir(), &query))
+            .filter(|f| self.folder_hit(&f.dir(), &query))
             .count()
+    }
+
+    /// Whether a folder card answers the search: an added folder by its
+    /// path, a folder inside the one on show by its name (all of them
+    /// share the path up to there).
+    fn folder_hit(&self, dir: &Path, query: &str) -> bool {
+        if self.0.in_folder.get() {
+            query.is_empty() || folder_name(dir).to_lowercase().contains(query)
+        } else {
+            folder_matches(dir, query)
+        }
     }
 
     /// Rings the colour a folder has in the card menu.
@@ -612,12 +636,39 @@ impl Home {
         self.emit_count();
     }
 
-    /// The added folders, shown as cards above the notes.
+    /// The added folders, shown as cards above the notes (outside of them).
     pub fn set_folders(&self, folders: Vec<Folder>) {
+        self.0.added.replace(folders.clone());
+        if !self.0.in_folder.get() {
+            self.show_folders(folders);
+        }
+    }
+
+    /// The folders with notes inside the folder on show, as cards above its
+    /// notes, in the colour of the added folder they are in.
+    pub fn set_subfolders(&self, dirs: Vec<PathBuf>, color: Option<String>) {
+        if !self.0.in_folder.get() {
+            return;
+        }
+        // a `Folder` keeps its path as text: one that is not UTF-8 would
+        // come back as another (and Kludd could not save to it either)
+        let folders = dirs
+            .iter()
+            .filter(|dir| dir.to_str().is_some())
+            .map(|dir| Folder {
+                path: config::tilde_path(dir),
+                color: color.clone(),
+            })
+            .collect();
+        self.show_folders(folders);
+    }
+
+    fn show_folders(&self, folders: Vec<Folder>) {
         let grid = &self.0.folders_grid;
         grid.remove_all();
+        let inside = self.0.in_folder.get();
         for folder in &folders {
-            grid.append(&folder_card(folder));
+            grid.append(&folder_card(folder, inside));
         }
         self.0.folders.replace(folders);
         grid.invalidate_filter();
@@ -625,13 +676,24 @@ impl Home {
     }
 
     /// What is listed: the notes folder with the added folders (`None`), or
-    /// the notes of one added folder. Starts without a search.
-    pub fn set_place(&self, folder: Option<&Path>) {
-        self.0.in_folder.set(folder.is_some());
+    /// the notes of a folder, whose back button goes to `up` (the folder it
+    /// is in) or, without one, to the notes. Starts without a search.
+    pub fn set_place(&self, folder: Option<&Path>, up: Option<&Path>) {
+        let was_in_folder = self.0.in_folder.replace(folder.is_some());
         self.0
             .title
             .set_text(&folder.map_or_else(|| "My notes".into(), folder_name));
         self.0.back.set_visible(folder.is_some());
+        self.0
+            .back_label
+            .set_text(&up.map_or_else(|| "My notes".into(), folder_name));
+        // the folder's own folders come with its notes (`set_subfolders`)
+        if folder.is_some() {
+            self.show_folders(Vec::new());
+        } else if was_in_folder {
+            let added = self.0.added.borrow().clone();
+            self.show_folders(added);
+        }
         self.0.add_button.set_visible(folder.is_none());
         self.close_popovers();
         self.cancel_add_folder();
@@ -747,14 +809,12 @@ impl Home {
             .iter()
             .find(|n| n.title.to_lowercase().contains(&query))
             .map(|n| n.path.clone());
-        let folder = if self.0.in_folder.get() {
-            None
-        } else {
+        let folder = {
             let folders = self.0.folders.borrow();
             folders
                 .iter()
                 .map(Folder::dir)
-                .find(|dir| folder_matches(dir, &query))
+                .find(|dir| self.folder_hit(dir, &query))
         };
         let by_text = notes
             .iter()
@@ -872,7 +932,9 @@ fn card(note: &Note) -> gtk::FlowBoxChild {
 
 /// A folder card: its name, and where it is (the start of a long path is
 /// what gets cut; the end tells folders apart), in its colour if it has one.
-fn folder_card(folder: &Folder) -> gtk::FlowBoxChild {
+/// A folder `inside` the one on show says what it holds instead: they are
+/// all in the same place.
+fn folder_card(folder: &Folder, inside: bool) -> gtk::FlowBoxChild {
     let path = &folder.dir();
     let icon = Icon::new(theme::ICON_FOLDER, 14);
     icon.add_css_class("folder-icon");
@@ -887,7 +949,11 @@ fn folder_card(folder: &Folder) -> gtk::FlowBoxChild {
     head.append(&icon);
     head.append(&title);
     let place = gtk::Label::builder()
-        .label(path.parent().map(config::tilde_path).unwrap_or_default())
+        .label(if inside {
+            holds(path)
+        } else {
+            path.parent().map(config::tilde_path).unwrap_or_default()
+        })
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::Start)
         .single_line_mode(true)
@@ -905,6 +971,23 @@ fn folder_card(folder: &Folder) -> gtk::FlowBoxChild {
     child.set_child(Some(&body));
     child.set_cursor_from_name(Some("pointer"));
     child
+}
+
+/// "3 notes" right in `dir`, or "Folders of notes" when they are all
+/// further in.
+fn holds(dir: &Path) -> String {
+    let notes = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|path| storage::is_note(path) && path.is_file())
+        .count();
+    match notes {
+        0 => "Folders of notes".into(),
+        1 => "1 note".into(),
+        n => format!("{n} notes"),
+    }
 }
 
 /// `~/code/app/notes` -> `notes`.

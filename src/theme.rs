@@ -230,6 +230,77 @@ popover.toolbar .i { font-style: italic; }
 popover.toolbar .u label { text-decoration-line: underline; }
 popover.toolbar .s label { text-decoration-line: line-through; }
 popover.toolbar button.icon { padding: 0 5px; }
+
+/* word count: a quiet pill in the corner, and its menu (Ctrl+Shift+C) */
+.word-count {
+  background-color: mix(@paper, @ink, 0.08);
+  border-radius: 10px;
+  padding: 1px 9px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.word-count label { opacity: 0.75; }
+.word-count:hover { background-color: mix(@paper, @ink, 0.14); }
+popover.stats > contents {
+  border-radius: 14px;
+  padding: 12px 14px 10px 14px;
+  font-size: 13px;
+  min-width: 250px;
+}
+popover.stats .value { font-size: 22px; font-weight: 500; line-height: 26px; }
+popover.stats .caption { font-size: 11px; opacity: 0.65; }
+popover.stats .rule {
+  min-height: 1px;
+  background-color: alpha(@paper, 0.15);
+  margin: 11px 0 8px 0;
+}
+popover.stats .toggle label { font-size: 12px; }
+popover.stats switch {
+  min-width: 32px;
+  min-height: 18px;
+  border-radius: 10px;
+  background-color: alpha(@paper, 0.22);
+}
+popover.stats switch:checked { background-color: @accent; }
+popover.stats switch image { opacity: 0; }
+popover.stats switch slider {
+  min-width: 14px;
+  min-height: 14px;
+  margin: 2px;
+  border-radius: 7px;
+  background-color: @paper;
+}
+popover.stats switch:checked slider { background-color: @ink; }
+
+/* find in the note: a pill like the format toolbar, top right */
+.find {
+  background-color: @ink;
+  color: @paper;
+  border-radius: 12px;
+  padding: 3px 4px 3px 10px;
+  font-size: 13px;
+}
+.find text {
+  color: @paper;
+  caret-color: @paper;
+}
+.find text > placeholder { color: @paper; opacity: 0.55; }
+.find text selection { background-color: alpha(@paper, 0.3); color: @paper; }
+.find .count {
+  font-family: "JetBrains Mono";
+  font-size: 11px;
+  opacity: 0.65;
+  margin: 0 4px 0 6px;
+}
+.find .count.none { opacity: 1; color: @accent; }
+.find button {
+  min-width: 24px;
+  min-height: 24px;
+  border-radius: 8px;
+}
+.find button:hover { background-color: alpha(@paper, 0.15); }
+.find button:active { background-color: alpha(@paper, 0.25); }
+.find button:disabled { opacity: 0.35; }
 "#;
 
 /// Owns the CSS providers for one display.
@@ -306,6 +377,9 @@ pub const ICON_FOLDER_PLUS: &str = include_str!("../assets/icons/folder-plus.svg
 pub const ICON_TASK: &str = include_str!("../assets/icons/square-check.svg");
 pub const ICON_QUOTE: &str = include_str!("../assets/icons/quote.svg");
 pub const ICON_HIGHLIGHT: &str = include_str!("../assets/icons/highlight.svg");
+pub const ICON_UP: &str = include_str!("../assets/icons/chevron-up.svg");
+pub const ICON_DOWN: &str = include_str!("../assets/icons/chevron-down.svg");
+pub const ICON_CLOSE: &str = include_str!("../assets/icons/x.svg");
 // GitHub's alerts: note, tip, important, warning, caution
 pub const ICON_NOTE: &str = include_str!("../assets/icons/info-circle.svg");
 pub const ICON_TIP: &str = include_str!("../assets/icons/bulb.svg");
@@ -408,6 +482,9 @@ mod tests {
         assert_eq!(svg_paths(ICON_FOLDER).count(), 1);
         assert_eq!(svg_paths(ICON_FOLDER_PLUS).count(), 3);
         for icon in [
+            ICON_UP,
+            ICON_DOWN,
+            ICON_CLOSE,
             ICON_TASK,
             ICON_QUOTE,
             ICON_HIGHLIGHT,

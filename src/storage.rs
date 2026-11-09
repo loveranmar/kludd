@@ -77,6 +77,91 @@ pub fn scan(dir: &Path, previous: &[Note]) -> Vec<Note> {
     notes
 }
 
+/// How deep below a folder [`subfolders`] looks for notes, and how many
+/// folders under each card's folder it goes into at most, so a folder like
+/// `~/code` with huge trees in it stays quick.
+const NOTES_DEPTH: usize = 12;
+const NOTES_BUDGET: usize = 2_000;
+
+/// The folders right inside `dir` that have notes (`.md`, `.txt`) in them,
+/// at any depth
+/// (within reason), sorted by name. Hidden folders are left out, and
+/// symlinked ones too, so a link back up can never loop.
+pub fn subfolders(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .filter(is_plain_dir)
+        .map(|e| e.path())
+        .filter(|path| {
+            let mut budget = NOTES_BUDGET;
+            has_notes(path, NOTES_DEPTH, &mut budget)
+        })
+        .collect();
+    dirs.sort_by_key(|p| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    });
+    dirs
+}
+
+/// The real, visible folders right inside `dir`.
+pub fn plain_dirs(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(is_plain_dir)
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A real, visible folder (not a symlink to one).
+fn is_plain_dir(entry: &std::fs::DirEntry) -> bool {
+    let visible = !entry.file_name().to_string_lossy().starts_with('.');
+    visible && entry.file_type().is_ok_and(|t| t.is_dir())
+}
+
+/// A visible folder, or something gone (that may have been one): a change
+/// to it may change which folders have notes.
+pub fn may_be_folder(path: &Path) -> bool {
+    let visible = path
+        .file_name()
+        .is_some_and(|n| !n.to_string_lossy().starts_with('.'));
+    visible && std::fs::symlink_metadata(path).map_or(true, |m| m.is_dir())
+}
+
+/// Is there a note in `dir` or a folder under it?
+fn has_notes(dir: &Path, depth: usize, budget: &mut usize) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    // every file of a folder is looked at (a note among thousands of
+    // other files counts); the budget is for the folders gone into
+    let mut inner = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_plain_dir(&entry) {
+            inner.push(path);
+        } else if is_note(&path) && path.is_file() {
+            return true;
+        }
+    }
+    depth > 0
+        && inner.iter().any(|d| {
+            if *budget == 0 {
+                return false;
+            }
+            *budget -= 1;
+            has_notes(d, depth - 1, budget)
+        })
+}
+
 fn note_from(path: PathBuf, text: &str, modified: SystemTime, len: u64) -> Note {
     // plain text has no `# ` title and shows exactly what it holds
     let (title, shown) = if is_markdown(&path) {
@@ -296,6 +381,33 @@ mod tests {
         assert!(notes.iter().any(|n| n.matches("hello")));
         assert!(notes.iter().any(|n| n.matches("# not a title")));
         assert!(!notes.iter().any(|n| n.matches("nope")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn folders_with_notes() {
+        let dir = temp_dir("subfolders");
+        let mk = |rel: &str, text: &str| {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        mk("readme.md", "# Readme\n");
+        mk("notes.txt", "plain");
+        mk("Paywall/plan.md", "# Plan\n");
+        mk("deep/a/b/c.md", "# Deep\n");
+        mk("text/only.txt", "plain");
+        mk("assets/logo.png", "png");
+        mk("assets/data.json", "{}");
+        mk(".git/x.md", "# hidden\n");
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("loop")).unwrap();
+        // folders with notes somewhere in them, by name; never symlinks
+        assert_eq!(
+            subfolders(&dir),
+            [dir.join("deep"), dir.join("Paywall"), dir.join("text")],
+            "no notes, hidden or symlinked: left out"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

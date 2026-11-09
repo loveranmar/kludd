@@ -669,7 +669,7 @@ impl Opening {
 }
 
 fn parse_inline(src: &str, offset: usize, kind: LineKind) -> Option<Vec<Span>> {
-    let mut events = Parser::new_ext(src, options()).into_offset_iter();
+    let mut events = Parser::new_ext(src, inline_options(src)).into_offset_iter();
 
     // The block structure must be exactly what the prefix promises.
     let opening = Opening::of(kind);
@@ -2021,6 +2021,24 @@ pub fn inlines(spans: &[Span]) -> Vec<Inline> {
     out
 }
 
+/// The options for reading a run of text: no math in it if a `$` that
+/// would close some is right before a digit, as in `$7 a week, $38 a
+/// year`: those are prices (GitHub reads them so too).
+fn inline_options(src: &str) -> Options {
+    let prices = src.contains('$')
+        && Parser::new_ext(src, options())
+            .into_offset_iter()
+            .any(|(event, range)| {
+                matches!(event, Event::InlineMath(_))
+                    && src[range.end..].starts_with(|c: char| c.is_ascii_digit())
+            });
+    if prices {
+        options() - Options::ENABLE_MATH
+    } else {
+        options()
+    }
+}
+
 /// Links, code spans, images, math and formatting in a run of Markdown
 /// source starting at char `base`.
 fn raw_inlines(run: &str, base: usize, out: &mut Vec<Inline>) {
@@ -2031,7 +2049,7 @@ fn raw_inlines(run: &str, base: usize, out: &mut Vec<Inline>) {
     type Open = (InlineKind, Range<usize>, String, Option<Range<usize>>);
     let mut links: Vec<Open> = Vec::new();
     let mut marks: Vec<(InlineKind, Range<usize>)> = Vec::new();
-    for (event, range) in Parser::new_ext(src, options()).into_offset_iter() {
+    for (event, range) in Parser::new_ext(src, inline_options(src)).into_offset_iter() {
         let in_image = links.iter().any(|(k, ..)| *k == InlineKind::Image);
         match &event {
             Event::Start(Tag::Link {
@@ -2585,7 +2603,27 @@ pub fn title(src: &str) -> Option<String> {
 /// (`Call the **dentist**` matches "the dentist").
 pub fn searchable(src: &str) -> String {
     let mut out = String::new();
-    for event in Parser::new_ext(src, options()) {
+    // math is read as its text: `$7 a week, $38 a year` is prices
+    for event in Parser::new_ext(src, options() - Options::ENABLE_MATH) {
+        // a block starts on a line of its own: a list nested in a tight
+        // item comes right after the item's text, with nothing between
+        if let Event::Start(
+            Tag::Paragraph
+            | Tag::Heading { .. }
+            | Tag::List(_)
+            | Tag::Item
+            | Tag::CodeBlock(_)
+            | Tag::HtmlBlock
+            | Tag::BlockQuote(_)
+            | Tag::Table(_)
+            | Tag::TableRow
+            | Tag::TableHead,
+        ) = &event
+            && !out.is_empty()
+            && !out.ends_with(char::is_whitespace)
+        {
+            out.push('\n');
+        }
         match event {
             Event::Text(t) | Event::Code(t) | Event::InlineHtml(t) | Event::Html(t) => {
                 if !t.starts_with('<') {
@@ -3479,6 +3517,20 @@ mod tests {
             found(&spans("x $a+b$ y\n")),
             [(Math, "a+b".into(), String::new())]
         );
+        // prices are no math: a `$` that would close some is before a digit
+        let prices = "- commit to **$7/week** but not to **$38/year**, even so\n";
+        round_trip(prices);
+        let lines = parse(prices);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|s| s.text == "$7/week" && s.style.has(Style::BOLD)),
+            "bold, not math: {:?}",
+            lines[0].spans
+        );
+        assert!(!found(&lines[0].spans).iter().any(|(k, ..)| *k == Math));
+        round_trip("Costs $5 and $10 a month.\n");
         assert_eq!(
             found(&spans(
                 "H<sub>2</sub>O <mark>m</mark> <br> <!-- c --> <a href=\"u\">t</a> <img src=\"p.png\">\n"
