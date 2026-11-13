@@ -4733,12 +4733,23 @@ impl Editor {
         menu.popup();
     }
 
-    /// The word count menu goes above the counter's corner, bottom left.
+    /// The word count menu goes in the bottom left corner: just above the
+    /// "x words" counter when it shows, so none of the counter peeks out
+    /// from under the menu.
     fn place_word_count_menu(&self) {
-        let y = self.0.root.height() - 12;
-        let menu = &self.0.word_count.menu;
-        menu.set_pointing_to(Some(&gdk::Rectangle::new(24, y, 1, 1)));
-        menu.set_halign(gtk::Align::Start);
+        let wc = &self.0.word_count;
+        let corner = (24.0, f64::from(self.0.root.height() - 12));
+        let (x, y) = if wc.counter.is_visible() {
+            wc.counter
+                .compute_bounds(&self.0.root)
+                .map(|b| (f64::from(b.x()), f64::from(b.y()) - 6.0))
+                .unwrap_or(corner)
+        } else {
+            corner
+        };
+        wc.menu
+            .set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        wc.menu.set_halign(gtk::Align::Start);
     }
 
     /// Closes the word count menu; false if it was not open.

@@ -101,8 +101,6 @@ impl WordCount {
         numbers.append(&words_box);
         numbers.append(&chars_box);
 
-        let rule = gtk::Box::builder().css_classes(["rule"]).build();
-
         let switch = gtk::Switch::builder()
             .valign(gtk::Align::Center)
             .focus_on_click(false)
@@ -137,7 +135,6 @@ impl WordCount {
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&numbers);
-        content.append(&rule);
         content.append(&toggle);
 
         // never grabs (see `home::popover`): Esc and clicks elsewhere close it

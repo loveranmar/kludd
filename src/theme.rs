@@ -249,11 +249,8 @@ popover.stats > contents {
 }
 popover.stats .value { font-size: 22px; font-weight: 500; line-height: 26px; }
 popover.stats .caption { font-size: 11px; opacity: 0.65; }
-popover.stats .rule {
-  min-height: 1px;
-  background-color: alpha(@paper, 0.15);
-  margin: 11px 0 8px 0;
-}
+/* no lines in it: a gap is all that parts the numbers from the switch */
+popover.stats .toggle { margin-top: 14px; }
 popover.stats .toggle label { font-size: 12px; }
 popover.stats switch {
   min-width: 32px;
